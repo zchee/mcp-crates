@@ -10,5 +10,6 @@
 pub mod error;
 pub mod server;
 pub mod tools;
+pub mod untrusted;
 
 pub use crate::server::CratesServer;

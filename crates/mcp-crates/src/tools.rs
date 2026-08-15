@@ -233,8 +233,9 @@ pub struct CrateInfoResult {
     /// The crate's one-line description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// The newest version that is neither yanked nor a pre-release. This is
-    /// what `cargo add` would pick.
+    /// The newest version that is neither yanked nor a pre-release, falling
+    /// back to the highest pre-release for a crate that has only ever published
+    /// those. This is what `cargo add` would pick.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_stable_version: Option<String>,
     /// The highest version of any kind, pre-releases included and yanked
@@ -350,7 +351,9 @@ pub struct CrateVersionsResult {
     pub name: String,
     /// How many versions have ever been published, before filtering.
     pub total_versions: usize,
-    /// The newest version that is neither yanked nor a pre-release.
+    /// The newest version that is neither yanked nor a pre-release, falling
+    /// back to the highest pre-release for a crate that has only ever published
+    /// those.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_stable_version: Option<String>,
     /// The highest version of any kind, pre-releases included and yanked
@@ -526,7 +529,8 @@ pub struct ItemDoc {
     pub path: String,
     /// The rustdoc item kind: `struct`, `trait`, `function`, `module`, and so on.
     pub kind: String,
-    /// The item's documentation, as written in its doc comment.
+    /// The item's documentation, as written in its doc comment, framed as
+    /// third-party content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub documentation: Option<String>,
     /// Whether the item is deprecated.
@@ -535,11 +539,16 @@ pub struct ItemDoc {
 }
 
 impl From<&DocItem> for ItemDoc {
+    /// The documentation is a doc comment written by whoever published the
+    /// crate, so it is framed rather than passed through bare.
     fn from(item: &DocItem) -> Self {
         Self {
             path: item.path.to_string(),
             kind: item.kind.to_string(),
-            documentation: item.docs.as_ref().map(ToString::to_string),
+            documentation: item
+                .docs
+                .as_ref()
+                .map(|docs| crate::untrusted::frame("documentation", docs)),
             deprecated: item.deprecated,
         }
     }
@@ -591,7 +600,8 @@ pub struct CrateDocumentationResult {
     /// its absence does not by itself mean the build failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docs_rs_built: Option<bool>,
-    /// The crate's README, converted to Markdown.
+    /// The crate's README, converted to Markdown and framed as third-party
+    /// content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub readme: Option<String>,
     /// The item the `item` argument resolved to.
