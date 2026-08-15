@@ -44,21 +44,11 @@ struct Cli {
     api_interval_ms: u64,
 
     /// Longest a request may wait behind the pacing queue before it is shed.
-    #[arg(
-        long,
-        env = "MCP_CRATES_QUEUE_WAIT_SECS",
-        value_name = "SECS",
-        default_value_t = 30
-    )]
+    #[arg(long, env = "MCP_CRATES_QUEUE_WAIT_SECS", value_name = "SECS", default_value_t = 30)]
     queue_wait_secs: u64,
 
     /// Approximate ceiling on the response cache, in mebibytes.
-    #[arg(
-        long,
-        env = "MCP_CRATES_CACHE_MIB",
-        value_name = "MIB",
-        default_value_t = 128
-    )]
+    #[arg(long, env = "MCP_CRATES_CACHE_MIB", value_name = "MIB", default_value_t = 128)]
     cache_mib: u64,
 
     /// Log filter, in `tracing` `EnvFilter` syntax. Logs are written to stderr,
@@ -131,9 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let client = Arc::new(Client::new(config)?);
-    let service = CratesServer::new(Arc::clone(&client))
-        .serve(stdio())
-        .await?;
+    let service = CratesServer::new(Arc::clone(&client)).serve(stdio()).await?;
 
     let reason = service.waiting().await?;
     let stats = client.stats();
@@ -184,10 +172,7 @@ mod tests {
     #[test]
     fn an_api_interval_faster_than_policy_is_raised_to_the_policy_minimum() {
         let config = parse(&["--api-interval-ms", "10"]).config();
-        assert_eq!(
-            config.api_min_interval,
-            Duration::from_millis(POLICY_MIN_API_INTERVAL_MS)
-        );
+        assert_eq!(config.api_min_interval, Duration::from_millis(POLICY_MIN_API_INTERVAL_MS));
     }
 
     #[test]

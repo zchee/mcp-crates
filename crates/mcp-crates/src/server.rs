@@ -59,17 +59,12 @@ impl CratesServer {
     /// Wrap a client in the MCP tool surface.
     #[must_use]
     pub fn new(client: Arc<Client>) -> Self {
-        Self {
-            client,
-            tool_router: Self::tool_router(),
-        }
+        Self { client, tool_router: Self::tool_router() }
     }
 
     /// Parse a caller's version argument.
     fn selector(raw: Option<&str>) -> Result<Selector, ErrorData> {
-        raw.unwrap_or("latest")
-            .parse::<Selector>()
-            .map_err(|err| to_error_data(&err))
+        raw.unwrap_or("latest").parse::<Selector>().map_err(|err| to_error_data(&err))
     }
 
     /// Resolve a selector against a crate's index.
@@ -82,20 +77,16 @@ impl CratesServer {
         selector: &Selector,
     ) -> Result<&'a IndexEntry, ErrorData> {
         let allow_yanked = matches!(selector, Selector::Exact(_));
-        index
-            .resolve(selector, allow_yanked)
-            .map_err(|err| to_error_data(&err))
+        index.resolve(selector, allow_yanked).map_err(|err| to_error_data(&err))
     }
 }
 
 #[tool_router]
 impl CratesServer {
     /// Search crates.io for crates.
-    #[tool(
-        description = "Search crates.io for Rust crates by free text, keyword or category. Use \
-                       this when the crate name is unknown. Returns each crate's description, \
-                       latest version, download counts and repository."
-    )]
+    #[tool(description = "Search crates.io for Rust crates by free text, keyword or category. \
+                          Use this when the crate name is unknown. Returns each crate's \
+                          description, latest version, download counts and repository.")]
     async fn search_crates(
         &self,
         Parameters(args): Parameters<SearchCratesArgs>,
@@ -124,11 +115,7 @@ impl CratesServer {
             include_yanked: args.include_yanked.unwrap_or(false),
         };
 
-        let response = self
-            .client
-            .search(&params)
-            .await
-            .map_err(|err| to_error_data(&err))?;
+        let response = self.client.search(&params).await.map_err(|err| to_error_data(&err))?;
 
         Ok(Json(SearchCratesResult {
             total_matches: response.meta.total,
@@ -139,11 +126,9 @@ impl CratesServer {
     }
 
     /// Fetch one crate's metadata.
-    #[tool(
-        description = "Get metadata for one crate by exact name: description, links, download \
-                       counts, keywords, categories, and a summary of its current release \
-                       including the minimum supported Rust version and feature list."
-    )]
+    #[tool(description = "Get metadata for one crate by exact name: description, links, download \
+                          counts, keywords, categories, and a summary of its current release \
+                          including the minimum supported Rust version and feature list.")]
     async fn get_crate_info(
         &self,
         Parameters(args): Parameters<GetCrateInfoArgs>,
@@ -200,11 +185,10 @@ impl CratesServer {
     }
 
     /// List a crate's published versions.
-    #[tool(
-        description = "List the published versions of a crate, newest first, with yank status, \
-                       minimum supported Rust version and publication date. Optionally filtered \
-                       by a Cargo version requirement such as '^1.2' or '>=0.4, <0.6'."
-    )]
+    #[tool(description = "List the published versions of a crate, newest first, with yank \
+                          status, minimum supported Rust version and publication date. \
+                          Optionally filtered by a Cargo version requirement such as '^1.2' or \
+                          '>=0.4, <0.6'.")]
     async fn get_crate_versions(
         &self,
         Parameters(args): Parameters<GetCrateVersionsArgs>,
@@ -226,11 +210,7 @@ impl CratesServer {
         let include_yanked = args.include_yanked.unwrap_or(false);
         let include_prerelease = args.include_prerelease.unwrap_or(false);
 
-        let index = self
-            .client
-            .index(&args.name)
-            .await
-            .map_err(|err| to_error_data(&err))?;
+        let index = self.client.index(&args.name).await.map_err(|err| to_error_data(&err))?;
 
         let matching: Vec<&IndexEntry> = index
             .descending()
@@ -245,11 +225,8 @@ impl CratesServer {
             .collect();
 
         let truncated = matching.len() > limit as usize;
-        let versions = matching
-            .iter()
-            .take(limit as usize)
-            .map(|entry| VersionEntry::from(*entry))
-            .collect();
+        let versions =
+            matching.iter().take(limit as usize).map(|entry| VersionEntry::from(*entry)).collect();
 
         Ok(Json(CrateVersionsResult {
             name: index.name().to_owned(),
@@ -265,11 +242,10 @@ impl CratesServer {
     }
 
     /// Report one version's dependencies.
-    #[tool(
-        description = "List what one version of a crate depends on, with each dependency's \
-                       version requirement, enabled features, target platform and whether it is \
-                       optional. Defaults to runtime dependencies of the newest stable release."
-    )]
+    #[tool(description = "List what one version of a crate depends on, with each dependency's \
+                          version requirement, enabled features, target platform and whether it \
+                          is optional. Defaults to runtime dependencies of the newest stable \
+                          release.")]
     async fn get_crate_dependencies(
         &self,
         Parameters(args): Parameters<GetCrateDependenciesArgs>,
@@ -278,11 +254,7 @@ impl CratesServer {
         let kinds = args.kinds.unwrap_or_else(|| vec![DepKind::Normal]);
         let include_optional = args.include_optional.unwrap_or(true);
 
-        let index = self
-            .client
-            .index(&args.name)
-            .await
-            .map_err(|err| to_error_data(&err))?;
+        let index = self.client.index(&args.name).await.map_err(|err| to_error_data(&err))?;
         let entry = Self::resolve(&index, &selector)?;
 
         let collect = |kind: DepKind| -> Vec<DependencyEntry> {
@@ -307,11 +279,10 @@ impl CratesServer {
     }
 
     /// Fetch a crate's documentation.
-    #[tool(
-        description = "Get a crate's documentation: its README as Markdown, or, with the 'item' \
-                       argument, the doc comment of one specific type, trait, function or module \
-                       read from the rustdoc JSON docs.rs generated for that release."
-    )]
+    #[tool(description = "Get a crate's documentation: its README as Markdown, or, with the \
+                          'item' argument, the doc comment of one specific type, trait, function \
+                          or module read from the rustdoc JSON docs.rs generated for that \
+                          release.")]
     async fn get_crate_documentation(
         &self,
         Parameters(args): Parameters<GetCrateDocumentationArgs>,
@@ -319,26 +290,18 @@ impl CratesServer {
         let selector = Self::selector(args.version.as_deref())?;
         let max_chars = args
             .max_readme_chars
-            .map_or(crates_io_client::DEFAULT_README_CHARS, |chars| {
-                chars as usize
-            });
+            .map_or(crates_io_client::DEFAULT_README_CHARS, |chars| chars as usize);
         // A README is the useful default answer, but when a specific item was
         // asked for it is usually just noise around the answer.
         let want_readme = args.include_readme.unwrap_or(args.item.is_none());
 
-        let index = self
-            .client
-            .index(&args.name)
-            .await
-            .map_err(|err| to_error_data(&err))?;
+        let index = self.client.index(&args.name).await.map_err(|err| to_error_data(&err))?;
         let entry = Self::resolve(&index, &selector)?;
         let name = index.name().to_owned();
         let version = entry.vers.clone();
 
-        let docs_rs_url = self
-            .client
-            .docs_page_url(&name, &version)
-            .map_err(|err| to_error_data(&err))?;
+        let docs_rs_url =
+            self.client.docs_page_url(&name, &version).map_err(|err| to_error_data(&err))?;
 
         // The README lives on the crates.io CDN and the documentation on
         // docs.rs, so the two requests overlap rather than queue.
@@ -386,12 +349,7 @@ impl CratesServer {
                 let query = args.item.as_deref().unwrap_or_default();
                 let lookup = doc_index.lookup(query);
                 item = lookup.found.map(ItemDoc::from);
-                suggestions = lookup
-                    .suggestions
-                    .iter()
-                    .copied()
-                    .map(ItemDoc::from)
-                    .collect();
+                suggestions = lookup.suggestions.iter().copied().map(ItemDoc::from).collect();
                 if item.is_none() {
                     notes.push(if suggestions.is_empty() {
                         format!("no item matching {query:?} is documented in this release")
@@ -414,7 +372,6 @@ impl CratesServer {
         Ok(Json(CrateDocumentationResult {
             name,
             version,
-            documentation_url: entry_documentation(&index, &docs_rs_url),
             docs_rs_url,
             docs_rs_built,
             readme,
@@ -430,15 +387,6 @@ impl CratesServer {
 enum Docs {
     Status(Result<Arc<crates_io_client::BuildStatus>, Error>),
     Index(Result<Arc<crates_io_client::DocIndex>, Error>),
-}
-
-/// The crate's own documentation link, when it points somewhere other than the
-/// docs.rs page already reported.
-fn entry_documentation(_index: &CrateIndex, _docs_rs_url: &str) -> Option<String> {
-    // The sparse index carries no documentation URL; it is a crates.io field,
-    // and reporting it here would cost an extra API request for a link the
-    // caller can get from get_crate_info.
-    None
 }
 
 // Bound to the stored router rather than the macro's default of

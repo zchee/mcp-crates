@@ -182,10 +182,7 @@ pub struct CategoryRef {
 
 impl From<&CrateCategory> for CategoryRef {
     fn from(category: &CrateCategory) -> Self {
-        Self {
-            slug: category.slug.clone(),
-            name: category.category.clone(),
-        }
+        Self { slug: category.slug.clone(), name: category.category.clone() }
     }
 }
 
@@ -216,11 +213,7 @@ impl LatestReleaseSummary {
         Self {
             version: entry.vers.clone(),
             rust_version: entry.rust_version.clone(),
-            features: entry
-                .all_features()
-                .keys()
-                .map(|name| (*name).to_owned())
-                .collect(),
+            features: entry.all_features().keys().map(|name| (*name).to_owned()).collect(),
             required_dependencies: runtime().filter(|dep| !dep.optional).count(),
             optional_dependencies: runtime().filter(|dep| dep.optional).count(),
             links: entry.links.clone(),
@@ -336,9 +329,7 @@ impl From<&IndexEntry> for VersionEntry {
         Self {
             version: entry.vers.clone(),
             yanked: entry.yanked,
-            prerelease: entry
-                .version()
-                .is_some_and(|version| !version.pre.is_empty()),
+            prerelease: entry.version().is_some_and(|version| !version.pre.is_empty()),
             rust_version: entry.rust_version.clone(),
             published_at: entry.pubtime.clone(),
             features: entry.all_features().len(),
@@ -546,10 +537,11 @@ pub struct CrateDocumentationResult {
     /// The version the request resolved to.
     pub version: String,
     /// The docs.rs page for this release.
+    ///
+    /// The documentation URL a crate declares for itself is reported by
+    /// `get_crate_info`; repeating it here would cost an extra API request for
+    /// a link the caller can already get.
     pub docs_rs_url: String,
-    /// The documentation URL the crate declares, when it differs from docs.rs.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub documentation_url: Option<String>,
     /// Whether docs.rs built documentation for this release. Absent when not
     /// checked, which is the case whenever an item lookup was requested.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -593,16 +585,9 @@ mod tests {
 
         assert_eq!(summary.version, "1.0.0");
         assert_eq!(summary.rust_version.as_deref(), Some("1.75"));
-        assert_eq!(
-            summary.required_dependencies, 1,
-            "the build dependency is not a runtime one"
-        );
+        assert_eq!(summary.required_dependencies, 1, "the build dependency is not a runtime one");
         assert_eq!(summary.optional_dependencies, 1);
-        assert_eq!(
-            summary.features,
-            ["json", "std"],
-            "both feature tables are counted"
-        );
+        assert_eq!(summary.features, ["json", "std"], "both feature tables are counted");
         assert_eq!(summary.links.as_deref(), Some("z"));
     }
 
@@ -614,31 +599,18 @@ mod tests {
         assert!(!entry.yanked && !entry.prerelease);
         assert_eq!(entry.published_at.as_deref(), Some("2026-01-02T03:04:05Z"));
         assert_eq!(entry.features, 2);
-        assert_eq!(
-            entry.dependencies, 2,
-            "one required and one optional runtime dependency"
-        );
+        assert_eq!(entry.dependencies, 2, "one required and one optional runtime dependency");
     }
 
     #[test]
     fn a_renamed_dependency_is_reported_under_its_registry_name() {
         let entry = entry();
-        let build = entry
-            .deps
-            .iter()
-            .find(|dep| dep.package.is_some())
-            .expect("the fixture has one");
+        let build =
+            entry.deps.iter().find(|dep| dep.package.is_some()).expect("the fixture has one");
         let converted = DependencyEntry::from(build);
 
-        assert_eq!(
-            converted.name, "nix-real",
-            "the crate that is actually depended on"
-        );
-        assert_eq!(
-            converted.renamed_to.as_deref(),
-            Some("nix"),
-            "the name it is used under"
-        );
+        assert_eq!(converted.name, "nix-real", "the crate that is actually depended on");
+        assert_eq!(converted.renamed_to.as_deref(), Some("nix"), "the name it is used under");
         assert_eq!(converted.target.as_deref(), Some("cfg(unix)"));
     }
 

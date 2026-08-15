@@ -107,11 +107,7 @@ impl Policy {
     /// A cached policy with the given lifetime.
     #[must_use]
     pub fn cached(ttl: Duration, negative_ttl: Duration) -> Self {
-        Self {
-            ttl,
-            negative_ttl,
-            store: true,
-        }
+        Self { ttl, negative_ttl, store: true }
     }
 }
 
@@ -213,10 +209,7 @@ impl Fetcher {
             .tcp_keepalive(Duration::from_secs(60))
             .tcp_nodelay(true)
             .build()
-            .map_err(|source| Error::Network {
-                url: "<client construction>".to_owned(),
-                source,
-            })?;
+            .map_err(|source| Error::Network { url: "<client construction>".to_owned(), source })?;
 
         Ok(Self {
             client,
@@ -231,11 +224,7 @@ impl Fetcher {
                 .time_to_idle(Duration::from_secs(60))
                 .build(),
             api: Pacer::new("crates.io", config.api_min_interval, config.max_queue_wait),
-            cdn: Pacer::new(
-                "crates.io CDN",
-                config.cdn_min_interval,
-                config.max_queue_wait,
-            ),
+            cdn: Pacer::new("crates.io CDN", config.cdn_min_interval, config.max_queue_wait),
             docs: Pacer::new("docs.rs", config.docs_min_interval, config.max_queue_wait),
             counters: Counters::default(),
             jitter: AtomicU64::new(0x9E37_79B9_7F4A_7C15),
@@ -285,9 +274,7 @@ impl Fetcher {
         // request rather than one per caller.
         let gate = self
             .gates
-            .get_with(Arc::clone(&key), async {
-                Arc::new(tokio::sync::Mutex::new(()))
-            })
+            .get_with(Arc::clone(&key), async { Arc::new(tokio::sync::Mutex::new(())) })
             .await;
         let _guard = gate.lock().await;
 
@@ -300,9 +287,7 @@ impl Fetcher {
             return Self::interpret(Arc::clone(hit));
         }
 
-        let validators = stale
-            .as_deref()
-            .filter(|e| e.status < 300 && e.has_validator());
+        let validators = stale.as_deref().filter(|e| e.status < 300 && e.has_validator());
         let entry = match self.fetch_with_retry(url, validators, policy).await? {
             Wire::Body(body) => Arc::new(body),
             Wire::NotModified => {
@@ -318,9 +303,7 @@ impl Fetcher {
 
         let cacheable = (policy.store && entry.status < 300) || entry.status == 404;
         if cacheable {
-            self.bodies
-                .insert(Arc::clone(&key), Arc::clone(&entry))
-                .await;
+            self.bodies.insert(Arc::clone(&key), Arc::clone(&entry)).await;
         }
         Self::interpret(entry)
     }
@@ -378,10 +361,7 @@ impl Fetcher {
     /// from re-colliding, which does not require true randomness.
     fn backoff(&self, attempt: u32) -> Duration {
         let base_ms = 200_u64 << attempt.min(4);
-        let mixed = self
-            .jitter
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mixed = self.jitter.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let spread = (mixed >> 33) % (base_ms / 2 + 1);
         Duration::from_millis(base_ms + spread)
     }
@@ -416,13 +396,11 @@ impl Fetcher {
                 }
             }
 
-            let response = request.send().await.map_err(|source| Error::Network {
-                url: current.to_string(),
-                source,
-            })?;
-            self.counters
-                .network_requests
-                .fetch_add(1, Ordering::Relaxed);
+            let response = request
+                .send()
+                .await
+                .map_err(|source| Error::Network { url: current.to_string(), source })?;
+            self.counters.network_requests.fetch_add(1, Ordering::Relaxed);
 
             let status = response.status();
             if status == StatusCode::NOT_MODIFIED {
@@ -445,12 +423,10 @@ impl Fetcher {
                         url: current.to_string(),
                         reason: format!("HTTP {status} without a usable Location header"),
                     })?;
-                current = current
-                    .join(location)
-                    .map_err(|err| Error::UnsupportedUrl {
-                        url: current.to_string(),
-                        reason: format!("unusable Location {location:?}: {err}"),
-                    })?;
+                current = current.join(location).map_err(|err| Error::UnsupportedUrl {
+                    url: current.to_string(),
+                    reason: format!("unusable Location {location:?}: {err}"),
+                })?;
                 continue;
             }
 
@@ -476,9 +452,7 @@ impl Fetcher {
             let headers = response.headers().clone();
             let final_url = current.to_string();
             let body = self.read_body(response, &current).await?;
-            self.counters
-                .bytes_received
-                .fetch_add(body.len() as u64, Ordering::Relaxed);
+            self.counters.bytes_received.fetch_add(body.len() as u64, Ordering::Relaxed);
 
             let ttl = if status.as_u16() == 404 {
                 policy.negative_ttl
@@ -503,29 +477,21 @@ impl Fetcher {
         if let Some(declared) = response.content_length()
             && declared > limit as u64
         {
-            return Err(Error::BodyTooLarge {
-                url: url.to_string(),
-                limit,
-            });
+            return Err(Error::BodyTooLarge { url: url.to_string(), limit });
         }
 
-        let hint = response
-            .content_length()
-            .unwrap_or(16 * 1024)
-            .min(limit as u64);
+        let hint = response.content_length().unwrap_or(16 * 1024).min(limit as u64);
         let mut buffer = BytesMut::with_capacity(usize::try_from(hint).unwrap_or(16 * 1024));
         let mut response = response;
-        while let Some(chunk) = response.chunk().await.map_err(|source| Error::Network {
-            url: url.to_string(),
-            source,
-        })? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|source| Error::Network { url: url.to_string(), source })?
+        {
             // Content-Length is absent or pre-decompression when the transfer is
             // compressed, so the ceiling is also enforced as bytes arrive.
             if buffer.len() + chunk.len() > limit {
-                return Err(Error::BodyTooLarge {
-                    url: url.to_string(),
-                    limit,
-                });
+                return Err(Error::BodyTooLarge { url: url.to_string(), limit });
             }
             buffer.extend_from_slice(&chunk);
         }
@@ -542,6 +508,14 @@ fn classify(url: &Url) -> Result<Origin> {
         return Err(Error::UnsupportedUrl {
             url: url.to_string(),
             reason: format!("scheme {:?} is not https", url.scheme()),
+        });
+    }
+    // A non-default port on an allowed host is still not an endpoint any of
+    // these services publishes, so it is refused rather than reasoned about.
+    if let Some(port) = url.port() {
+        return Err(Error::UnsupportedUrl {
+            url: url.to_string(),
+            reason: format!("port {port} is not the default https port"),
         });
     }
     let host = url.host_str().unwrap_or_default();
@@ -561,10 +535,7 @@ fn header_string(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Opti
 /// The client never serves a response for longer than the origin allows, but it
 /// also does not extend its own lifetime just because the origin offered more.
 fn effective_ttl(configured: Duration, headers: &HeaderMap) -> Duration {
-    let Some(control) = headers
-        .get(CACHE_CONTROL)
-        .and_then(|value| value.to_str().ok())
-    else {
+    let Some(control) = headers.get(CACHE_CONTROL).and_then(|value| value.to_str().ok()) else {
         return configured;
     };
     for directive in control.split(',') {
@@ -573,9 +544,8 @@ fn effective_ttl(configured: Duration, headers: &HeaderMap) -> Duration {
         {
             return Duration::ZERO;
         }
-        if let Some(seconds) = directive
-            .strip_prefix("max-age=")
-            .or_else(|| directive.strip_prefix("max-age ="))
+        if let Some(seconds) =
+            directive.strip_prefix("max-age=").or_else(|| directive.strip_prefix("max-age ="))
             && let Ok(seconds) = seconds.trim().parse::<u64>()
         {
             return configured.min(Duration::from_secs(seconds));
@@ -652,14 +622,19 @@ mod tests {
         let cases = [
             ("https://crates.io/api/v1/crates", Some(Origin::Api)),
             ("https://index.crates.io/se/rd/serde", Some(Origin::Cdn)),
-            (
-                "https://static.crates.io/readmes/serde/serde-1.0.0.html",
-                Some(Origin::Cdn),
-            ),
+            ("https://static.crates.io/readmes/serde/serde-1.0.0.html", Some(Origin::Cdn)),
             ("https://docs.rs/crate/serde/1.0.0/json", Some(Origin::Docs)),
             ("https://evil.invalid/steal", None),
             // A lookalike host must not be accepted by a suffix match.
             ("https://crates.io.evil.invalid/", None),
+            // The host of a URL carrying userinfo is what follows the `@`.
+            ("https://crates.io@evil.invalid/steal", None),
+            // A Unicode homograph is normalized to punycode, which no longer
+            // matches.
+            ("https://\u{0441}rates.io/steal", None),
+            // Nothing here is published on a non-default port.
+            ("https://crates.io:8443/steal", None),
+            ("https://[::1]/steal", None),
         ];
         for (raw, expected) in cases {
             let url = Url::parse(raw).expect("valid url");
@@ -691,10 +666,7 @@ mod tests {
 
     #[test]
     fn retry_after_is_parsed_and_bounded() {
-        assert_eq!(
-            retry_after(&headers(&[(RETRY_AFTER, "12")])),
-            Some(Duration::from_secs(12))
-        );
+        assert_eq!(retry_after(&headers(&[(RETRY_AFTER, "12")])), Some(Duration::from_secs(12)));
         assert_eq!(
             retry_after(&headers(&[(RETRY_AFTER, "99999")])),
             Some(Duration::from_secs(300)),
@@ -714,15 +686,8 @@ mod tests {
         assert_eq!(extract_detail(body), Some("Not Found; and more".to_owned()));
 
         assert_eq!(extract_detail(b""), None);
-        assert_eq!(
-            extract_detail(b"<!DOCTYPE html><html></html>"),
-            None,
-            "html is not a message"
-        );
-        assert_eq!(
-            extract_detail(b"plain failure"),
-            Some("plain failure".to_owned())
-        );
+        assert_eq!(extract_detail(b"<!DOCTYPE html><html></html>"), None, "html is not a message");
+        assert_eq!(extract_detail(b"plain failure"), Some("plain failure".to_owned()));
     }
 
     #[test]

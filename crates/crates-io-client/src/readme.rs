@@ -168,11 +168,7 @@ mod tests {
     fn runs_of_blank_lines_are_collapsed() {
         assert_eq!(collapse_blank_lines("a\n\n\n\n\nb"), "a\n\nb");
         assert_eq!(collapse_blank_lines("a\nb"), "a\nb");
-        assert_eq!(
-            collapse_blank_lines("a   \n\n\nb"),
-            "a\n\nb",
-            "trailing spaces go too"
-        );
+        assert_eq!(collapse_blank_lines("a   \n\n\nb"), "a\n\nb", "trailing spaces go too");
     }
 
     #[test]
@@ -220,14 +216,8 @@ mod tests {
 
     #[test]
     fn empty_links_are_removed_but_real_ones_are_kept() {
-        assert_eq!(
-            remove_empty_links("see [](#anchor)the docs"),
-            "see the docs"
-        );
-        assert_eq!(
-            remove_empty_links("see [the docs](https://x)"),
-            "see [the docs](https://x)"
-        );
+        assert_eq!(remove_empty_links("see [](#anchor)the docs"), "see the docs");
+        assert_eq!(remove_empty_links("see [the docs](https://x)"), "see [the docs](https://x)");
         assert_eq!(remove_empty_links("a [](#one) b [](#two) c"), "a  b  c");
     }
 

@@ -127,10 +127,7 @@ impl IndexItem {
     /// The item's kind and body.
     fn classify(&self) -> Option<(&str, &ItemBody)> {
         let inner = self.inner.as_ref()?;
-        inner
-            .iter()
-            .next()
-            .map(|(kind, body)| (kind.as_str(), body))
+        inner.iter().next().map(|(kind, body)| (kind.as_str(), body))
     }
 }
 
@@ -357,18 +354,12 @@ impl DocIndex {
         }
 
         if let Ok(position) = self.items.binary_search_by(|item| (*item.path).cmp(query)) {
-            return Lookup {
-                found: Some(&self.items[position]),
-                suggestions: Vec::new(),
-            };
+            return Lookup { found: Some(&self.items[position]), suggestions: Vec::new() };
         }
 
         let suffix = format!("::{query}");
-        let by_suffix: Vec<&DocItem> = self
-            .items
-            .iter()
-            .filter(|item| item.path.ends_with(&suffix))
-            .collect();
+        let by_suffix: Vec<&DocItem> =
+            self.items.iter().filter(|item| item.path.ends_with(&suffix)).collect();
         if let Some(resolved) = resolve(&by_suffix) {
             return resolved;
         }
@@ -388,10 +379,7 @@ impl DocIndex {
             .iter()
             .filter(|item| item.path.to_ascii_lowercase().contains(&lowered))
             .collect();
-        Lookup {
-            found: None,
-            suggestions: shortlist(fuzzy),
-        }
+        Lookup { found: None, suggestions: shortlist(fuzzy) }
     }
 }
 
@@ -399,14 +387,8 @@ impl DocIndex {
 fn resolve<'a>(candidates: &[&'a DocItem]) -> Option<Lookup<'a>> {
     match candidates {
         [] => None,
-        [only] => Some(Lookup {
-            found: Some(only),
-            suggestions: Vec::new(),
-        }),
-        many => Some(Lookup {
-            found: None,
-            suggestions: shortlist(many.to_vec()),
-        }),
+        [only] => Some(Lookup { found: Some(only), suggestions: Vec::new() }),
+        many => Some(Lookup { found: None, suggestions: shortlist(many.to_vec()) }),
     }
 }
 
@@ -468,11 +450,7 @@ fn collect_associated(
             continue;
         };
         let child_kind = child.classify().map_or("item", |(kind, _)| kind);
-        items.push(doc_item(
-            format!("{owner_path}::{name}"),
-            child_kind.to_owned(),
-            Some(child),
-        ));
+        items.push(doc_item(format!("{owner_path}::{name}"), child_kind.to_owned(), Some(child)));
     }
 }
 
@@ -509,18 +487,13 @@ pub fn decompress_rustdoc(name: &str, body: &[u8], limit: usize) -> Result<Vec<u
         .take(limit as u64 + 1);
 
     let mut expanded = Vec::with_capacity(body.len().saturating_mul(4).min(limit));
-    decoder
-        .read_to_end(&mut expanded)
-        .map_err(|err| Error::Decode {
-            url: format!("rustdoc JSON for {name}"),
-            message: format!("could not decompress the document: {err}"),
-        })?;
+    decoder.read_to_end(&mut expanded).map_err(|err| Error::Decode {
+        url: format!("rustdoc JSON for {name}"),
+        message: format!("could not decompress the document: {err}"),
+    })?;
 
     if expanded.len() > limit {
-        return Err(Error::BodyTooLarge {
-            url: format!("rustdoc JSON for {name}"),
-            limit,
-        });
+        return Err(Error::BodyTooLarge { url: format!("rustdoc JSON for {name}"), limit });
     }
     Ok(expanded)
 }
@@ -532,9 +505,7 @@ pub fn decompress_rustdoc(name: &str, body: &[u8], limit: usize) -> Result<Vec<u
 /// Returns [`Error::InvalidCrateName`] for an invalid name.
 pub fn status_url(name: &str, version: &str) -> Result<String> {
     validate_name(name)?;
-    Ok(format!(
-        "https://docs.rs/crate/{name}/{version}/status.json"
-    ))
+    Ok(format!("https://docs.rs/crate/{name}/{version}/status.json"))
 }
 
 /// The docs.rs rustdoc JSON URL for a release.
@@ -554,10 +525,7 @@ pub fn rustdoc_url(name: &str, version: &str) -> Result<String> {
 /// Returns [`Error::InvalidCrateName`] for an invalid name.
 pub fn html_url(name: &str, version: &str) -> Result<String> {
     validate_name(name)?;
-    Ok(format!(
-        "https://docs.rs/{name}/{version}/{}/",
-        name.replace('-', "_")
-    ))
+    Ok(format!("https://docs.rs/{name}/{version}/{}/", name.replace('-', "_")))
 }
 
 #[cfg(test)]
@@ -608,11 +576,7 @@ mod tests {
     }
 
     fn paths(index: &DocIndex) -> Vec<&str> {
-        index
-            .items()
-            .iter()
-            .map(|item| item.path.as_ref())
-            .collect()
+        index.items().iter().map(|item| item.path.as_ref()).collect()
     }
 
     #[test]
@@ -622,10 +586,7 @@ mod tests {
         assert_eq!(index.format_version(), Some(60));
         assert!(!index.is_truncated());
         assert!(
-            index
-                .items()
-                .iter()
-                .all(|item| item.path.starts_with("demo")),
+            index.items().iter().all(|item| item.path.starts_with("demo")),
             "a dependency's items are not this crate's documentation"
         );
     }
@@ -635,17 +596,12 @@ mod tests {
         // The path table has no entry for either, so without folding in the
         // trait's own members neither would be findable at all.
         let index = index();
-        let method = index
-            .lookup("demo::de::Deserializer::deserialize_any")
-            .found
-            .expect("resolves");
+        let method =
+            index.lookup("demo::de::Deserializer::deserialize_any").found.expect("resolves");
         assert_eq!(method.kind.as_ref(), "function");
         assert_eq!(method.docs.as_deref(), Some("Deserialize anything."));
 
-        let assoc = index
-            .lookup("demo::de::Deserializer::Error")
-            .found
-            .expect("resolves");
+        let assoc = index.lookup("demo::de::Deserializer::Error").found.expect("resolves");
         assert_eq!(assoc.kind.as_ref(), "assoc_type");
     }
 
@@ -680,40 +636,19 @@ mod tests {
     #[test]
     fn documentation_is_trimmed_and_absent_docs_stay_absent() {
         let index = index();
-        let found = index
-            .lookup("demo::de::Deserializer")
-            .found
-            .expect("resolves");
-        assert_eq!(
-            found.docs.as_deref(),
-            Some("A data format that can deserialize.")
-        );
+        let found = index.lookup("demo::de::Deserializer").found.expect("resolves");
+        assert_eq!(found.docs.as_deref(), Some("A data format that can deserialize."));
         assert_eq!(found.kind.as_ref(), "trait");
 
-        let undocumented = index
-            .lookup("demo::ser::Serializer")
-            .found
-            .expect("resolves");
+        let undocumented = index.lookup("demo::ser::Serializer").found.expect("resolves");
         assert_eq!(undocumented.docs, None);
     }
 
     #[test]
     fn deprecation_is_recorded() {
         let index = index();
-        assert!(
-            index
-                .lookup("demo::Legacy")
-                .found
-                .expect("resolves")
-                .deprecated
-        );
-        assert!(
-            !index
-                .lookup("demo::de::Deserializer")
-                .found
-                .expect("resolves")
-                .deprecated
-        );
+        assert!(index.lookup("demo::Legacy").found.expect("resolves").deprecated);
+        assert!(!index.lookup("demo::de::Deserializer").found.expect("resolves").deprecated);
     }
 
     #[test]
@@ -734,22 +669,12 @@ mod tests {
     fn an_ambiguous_query_suggests_rather_than_guesses() {
         let index = index();
         let result = index.lookup("Error");
-        assert!(
-            result.found.is_none(),
-            "three items named Error must not resolve to one"
-        );
-        let suggested: Vec<&str> = result
-            .suggestions
-            .iter()
-            .map(|item| item.path.as_ref())
-            .collect();
+        assert!(result.found.is_none(), "three items named Error must not resolve to one");
+        let suggested: Vec<&str> =
+            result.suggestions.iter().map(|item| item.path.as_ref()).collect();
         assert_eq!(
             suggested,
-            [
-                "demo::de::Error",
-                "demo::ser::Error",
-                "demo::de::Deserializer::Error"
-            ],
+            ["demo::de::Error", "demo::ser::Error", "demo::de::Deserializer::Error"],
             "shorter paths are the more likely intent"
         );
     }
@@ -763,11 +688,8 @@ mod tests {
         // first.
         let result = index.lookup("serial");
         assert!(result.found.is_none());
-        let suggested: Vec<&str> = result
-            .suggestions
-            .iter()
-            .map(|item| item.path.as_ref())
-            .collect();
+        let suggested: Vec<&str> =
+            result.suggestions.iter().map(|item| item.path.as_ref()).collect();
         assert_eq!(
             suggested,
             [
@@ -792,14 +714,8 @@ mod tests {
     fn a_document_with_no_items_of_its_own_is_rejected() {
         let foreign =
             r#"{"paths":{"1:0":{"crate_id":1,"path":["other"],"kind":"module"}},"index":{}}"#;
-        assert!(matches!(
-            DocIndex::parse("demo", foreign.as_bytes()),
-            Err(Error::Decode { .. })
-        ));
-        assert!(matches!(
-            DocIndex::parse("demo", b"not json"),
-            Err(Error::Decode { .. })
-        ));
+        assert!(matches!(DocIndex::parse("demo", foreign.as_bytes()), Err(Error::Decode { .. })));
+        assert!(matches!(DocIndex::parse("demo", b"not json"), Err(Error::Decode { .. })));
     }
 
     #[test]
@@ -814,10 +730,7 @@ mod tests {
             decompress_rustdoc("demo", &compressed, 1024),
             Err(Error::BodyTooLarge { .. })
         ));
-        assert!(matches!(
-            decompress_rustdoc("demo", b"not zstd", 1024),
-            Err(Error::Decode { .. })
-        ));
+        assert!(matches!(decompress_rustdoc("demo", b"not zstd", 1024), Err(Error::Decode { .. })));
     }
 
     #[test]
@@ -830,9 +743,6 @@ mod tests {
             status_url("serde", "1.0.0").expect("builds"),
             "https://docs.rs/crate/serde/1.0.0/status.json"
         );
-        assert!(matches!(
-            rustdoc_url("../evil", "1.0.0"),
-            Err(Error::InvalidCrateName { .. })
-        ));
+        assert!(matches!(rustdoc_url("../evil", "1.0.0"), Err(Error::InvalidCrateName { .. })));
     }
 }

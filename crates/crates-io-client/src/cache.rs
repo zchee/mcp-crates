@@ -120,9 +120,7 @@ impl CachedBody {
             return Ok(typed);
         }
         let value = Arc::new(project(&self.body)?);
-        let _ = self
-            .derived
-            .set(Arc::clone(&value) as Arc<dyn Any + Send + Sync>);
+        let _ = self.derived.set(Arc::clone(&value) as Arc<dyn Any + Send + Sync>);
         Ok(value)
     }
 }

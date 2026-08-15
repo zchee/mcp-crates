@@ -61,47 +61,28 @@ async fn sparse_index_describes_versions(client: &Client) {
     let index = client.index("serde").await.expect("serde is indexed");
 
     assert_eq!(index.name(), "serde");
-    assert!(
-        index.len() > 100,
-        "serde has a long release history, got {}",
-        index.len()
-    );
+    assert!(index.len() > 100, "serde has a long release history, got {}", index.len());
 
-    let latest = index
-        .resolve(&Selector::Default, false)
-        .expect("a stable release exists");
-    assert!(
-        !latest.yanked,
-        "the default selector must not resolve to a yanked release"
-    );
+    let latest = index.resolve(&Selector::Default, false).expect("a stable release exists");
+    assert!(!latest.yanked, "the default selector must not resolve to a yanked release");
     assert!(
         latest.version().expect("valid semver").pre.is_empty(),
         "the default selector must not resolve to a pre-release"
     );
-    assert!(
-        !latest.cksum.is_empty(),
-        "the index carries a checksum per release"
-    );
+    assert!(!latest.cksum.is_empty(), "the index carries a checksum per release");
 
     assert!(
-        index
-            .resolve(&"^1.0".parse().expect("valid requirement"), false)
-            .is_ok(),
+        index.resolve(&"^1.0".parse().expect("valid requirement"), false).is_ok(),
         "serde has a 1.x release"
     );
 }
 
 async fn dependencies_and_features_are_reported(client: &Client) {
     let index = client.index("reqwest").await.expect("reqwest is indexed");
-    let release = index
-        .resolve(&Selector::Default, false)
-        .expect("a stable release exists");
+    let release = index.resolve(&Selector::Default, false).expect("a stable release exists");
 
     assert!(!release.deps.is_empty(), "reqwest depends on other crates");
-    assert!(
-        !release.all_features().is_empty(),
-        "reqwest defines features"
-    );
+    assert!(!release.all_features().is_empty(), "reqwest defines features");
     assert!(
         release.deps.iter().any(|dep| dep.optional),
         "reqwest's TLS backends are optional dependencies"
@@ -115,17 +96,11 @@ async fn an_unknown_crate_is_reported_as_missing(client: &Client) {
         .expect_err("an unpublished name has no index document");
 
     assert_eq!(error.kind(), "crate_not_found", "got {error}");
-    assert!(
-        !error.retryable(),
-        "a missing crate will still be missing later"
-    );
+    assert!(!error.retryable(), "a missing crate will still be missing later");
 }
 
 async fn crate_metadata_omits_the_per_version_payload(client: &Client) {
-    let info = client
-        .crate_info("serde", Include::default())
-        .await
-        .expect("serde exists");
+    let info = client.crate_info("serde", Include::default()).await.expect("serde exists");
 
     assert_eq!(info.krate.name, "serde");
     assert!(info.krate.downloads > 0);
@@ -155,57 +130,30 @@ async fn search_finds_the_crate_it_was_given(client: &Client) {
 
 async fn readmes_arrive_as_markdown(client: &Client) {
     let index = client.index("anyhow").await.expect("anyhow is indexed");
-    let version = index
-        .resolve(&Selector::Default, false)
-        .expect("a release exists")
-        .vers
-        .clone();
+    let version = index.resolve(&Selector::Default, false).expect("a release exists").vers.clone();
 
-    let readme = client
-        .readme("anyhow", &version, 40_000)
-        .await
-        .expect("anyhow has a README");
+    let readme = client.readme("anyhow", &version, 40_000).await.expect("anyhow has a README");
 
-    assert!(
-        readme.contains("anyhow"),
-        "the README should mention the crate"
-    );
-    assert!(
-        !readme.contains("<p>"),
-        "HTML should have been converted to Markdown"
-    );
+    assert!(readme.contains("anyhow"), "the README should mention the crate");
+    assert!(!readme.contains("<p>"), "HTML should have been converted to Markdown");
     assert!(!readme.contains("<img"), "images should have been dropped");
 }
 
 async fn item_documentation_is_read_from_rustdoc_json(client: &Client) {
     let index = client.index("serde").await.expect("serde is indexed");
-    let version = index
-        .resolve(&Selector::Default, false)
-        .expect("a release exists")
-        .vers
-        .clone();
+    let version = index.resolve(&Selector::Default, false).expect("a release exists").vers.clone();
 
-    let docs = client
-        .doc_index("serde", &version)
-        .await
-        .expect("docs.rs built serde");
+    let docs = client.doc_index("serde", &version).await.expect("docs.rs built serde");
 
     // The path table alone lists roughly eighty items for serde; well past that
     // means the associated items were folded in as intended.
-    assert!(
-        docs.len() > 150,
-        "expected methods to be indexed too, got {}",
-        docs.len()
-    );
+    assert!(docs.len() > 150, "expected methods to be indexed too, got {}", docs.len());
 
     let method = docs
         .lookup("Deserializer::deserialize_any")
         .found
         .expect("a trait method resolves from its type and name alone");
-    assert_eq!(
-        method.path.as_ref(),
-        "serde::de::Deserializer::deserialize_any"
-    );
+    assert_eq!(method.path.as_ref(), "serde::de::Deserializer::deserialize_any");
     assert!(method.docs.is_some(), "the method is documented upstream");
 }
 
@@ -235,15 +183,10 @@ async fn concurrent_questions_share_one_request(client: &Arc<Client>) {
     for _ in 0..8 {
         // The gate is state inside the client, so the tasks have to share one.
         let client = Arc::clone(client);
-        handles.push(tokio::spawn(async move {
-            client.index("bytes").await.map(|_| ())
-        }));
+        handles.push(tokio::spawn(async move { client.index("bytes").await.map(|_| ()) }));
     }
     for handle in handles {
-        handle
-            .await
-            .expect("the task joins")
-            .expect("bytes is indexed");
+        handle.await.expect("the task joins").expect("bytes is indexed");
     }
 
     assert_eq!(
@@ -251,10 +194,7 @@ async fn concurrent_questions_share_one_request(client: &Arc<Client>) {
         1,
         "eight concurrent callers should share one request"
     );
-    assert!(
-        client.stats().coalesced >= 7,
-        "seven of the eight should have been coalesced"
-    );
+    assert!(client.stats().coalesced >= 7, "seven of the eight should have been coalesced");
 }
 
 async fn api_requests_are_paced(client: &Client) {
@@ -263,10 +203,7 @@ async fn api_requests_are_paced(client: &Client) {
     // before two seconds in.
     let started = Instant::now();
     for name in ["once_cell", "rand", "regex"] {
-        client
-            .crate_info(name, Include::default())
-            .await
-            .expect("the crate exists");
+        client.crate_info(name, Include::default()).await.expect("the crate exists");
     }
     let elapsed = started.elapsed();
 

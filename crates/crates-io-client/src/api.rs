@@ -95,11 +95,9 @@ impl SearchParams {
     /// Returns [`Error::InvalidArgument`] if the request describes no search at
     /// all, or if pagination is out of range.
     pub fn to_url(&self) -> Result<String> {
-        let mut url = Url::parse(API_BASE)
-            .and_then(|base| base.join("crates"))
-            .map_err(|err| {
-                Error::InvalidArgument(format!("could not build the search URL: {err}"))
-            })?;
+        let mut url = Url::parse(API_BASE).and_then(|base| base.join("crates")).map_err(|err| {
+            Error::InvalidArgument(format!("could not build the search URL: {err}"))
+        })?;
 
         let describes_a_search = self.query.is_some()
             || self.category.is_some()
@@ -407,33 +405,17 @@ mod tests {
 
     #[test]
     fn pagination_bounds_are_enforced_before_the_request_is_made() {
-        let base = SearchParams {
-            query: Some("serde".to_owned()),
-            ..SearchParams::default()
-        };
+        let base = SearchParams { query: Some("serde".to_owned()), ..SearchParams::default() };
 
-        let zero_page = SearchParams {
-            page: Some(0),
-            ..base.clone()
-        };
+        let zero_page = SearchParams { page: Some(0), ..base.clone() };
         assert!(matches!(zero_page.to_url(), Err(Error::InvalidArgument(_))));
 
-        let too_many = SearchParams {
-            per_page: Some(101),
-            ..base.clone()
-        };
+        let too_many = SearchParams { per_page: Some(101), ..base.clone() };
         assert!(matches!(too_many.to_url(), Err(Error::InvalidArgument(_))));
 
-        let ok = SearchParams {
-            page: Some(2),
-            per_page: Some(100),
-            ..base
-        };
+        let ok = SearchParams { page: Some(2), per_page: Some(100), ..base };
         let url = ok.to_url().expect("builds");
-        assert!(
-            url.contains("page=2") && url.contains("per_page=100"),
-            "{url}"
-        );
+        assert!(url.contains("page=2") && url.contains("per_page=100"), "{url}");
     }
 
     #[test]
@@ -448,27 +430,16 @@ mod tests {
 
     #[test]
     fn ids_are_validated_so_a_name_cannot_smuggle_in_a_path() {
-        let params = SearchParams {
-            ids: vec!["../../admin".to_owned()],
-            ..SearchParams::default()
-        };
-        assert!(matches!(
-            params.to_url(),
-            Err(Error::InvalidCrateName { .. })
-        ));
+        let params =
+            SearchParams { ids: vec!["../../admin".to_owned()], ..SearchParams::default() };
+        assert!(matches!(params.to_url(), Err(Error::InvalidCrateName { .. })));
     }
 
     #[test]
     fn the_default_include_omits_the_per_version_records() {
         let include = Include::default();
-        assert!(
-            !include.versions,
-            "per-version records come from the sparse index"
-        );
-        assert_eq!(
-            include.as_query_value(),
-            "keywords,categories,default_version,downloads"
-        );
+        assert!(!include.versions, "per-version records come from the sparse index");
+        assert_eq!(include.as_query_value(), "keywords,categories,default_version,downloads");
     }
 
     #[test]
@@ -478,10 +449,7 @@ mod tests {
             Err(Error::InvalidCrateName { .. })
         ));
         let url = crate_url("serde", Include::default()).expect("builds");
-        assert!(
-            url.starts_with("https://crates.io/api/v1/crates/serde?include="),
-            "{url}"
-        );
+        assert!(url.starts_with("https://crates.io/api/v1/crates/serde?include="), "{url}");
     }
 
     #[test]

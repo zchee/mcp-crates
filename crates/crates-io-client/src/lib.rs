@@ -153,15 +153,11 @@ impl Client {
     /// or an upstream error if the request fails.
     pub async fn search(&self, params: &SearchParams) -> Result<Arc<SearchResponse>> {
         let url = params.to_url()?;
-        let body = self
-            .fetcher
-            .get(&url, Policy::cached(self.ttl.search, self.ttl.negative))
-            .await?;
+        let body =
+            self.fetcher.get(&url, Policy::cached(self.ttl.search, self.ttl.negative)).await?;
         body.derive(|bytes| {
-            serde_json::from_slice::<SearchResponse>(bytes).map_err(|err| Error::Decode {
-                url: url.clone(),
-                message: err.to_string(),
-            })
+            serde_json::from_slice::<SearchResponse>(bytes)
+                .map_err(|err| Error::Decode { url: url.clone(), message: err.to_string() })
         })
     }
 
@@ -178,10 +174,8 @@ impl Client {
             .await
             .map_err(|err| missing_crate(err, name))?;
         body.derive(|bytes| {
-            serde_json::from_slice::<CrateResponse>(bytes).map_err(|err| Error::Decode {
-                url: url.clone(),
-                message: err.to_string(),
-            })
+            serde_json::from_slice::<CrateResponse>(bytes)
+                .map_err(|err| Error::Decode { url: url.clone(), message: err.to_string() })
         })
     }
 
@@ -239,17 +233,12 @@ impl Client {
         let url = docs::status_url(name, version)?;
         let body = self
             .fetcher
-            .get(
-                &url,
-                Policy::cached(self.ttl.docs_status, self.ttl.negative),
-            )
+            .get(&url, Policy::cached(self.ttl.docs_status, self.ttl.negative))
             .await
             .map_err(|err| missing_docs(err, name, version))?;
         body.derive(|bytes| {
-            serde_json::from_slice::<BuildStatus>(bytes).map_err(|err| Error::Decode {
-                url: url.clone(),
-                message: err.to_string(),
-            })
+            serde_json::from_slice::<BuildStatus>(bytes)
+                .map_err(|err| Error::Decode { url: url.clone(), message: err.to_string() })
         })
     }
 
@@ -300,9 +289,7 @@ impl Client {
 /// Translate a `404` on a crate-level resource into a crate-level error.
 fn missing_crate(err: Error, name: &str) -> Error {
     match err {
-        Error::Upstream { status: 404, .. } => Error::CrateNotFound {
-            name: name.to_owned(),
-        },
+        Error::Upstream { status: 404, .. } => Error::CrateNotFound { name: name.to_owned() },
         other => other,
     }
 }
@@ -310,9 +297,8 @@ fn missing_crate(err: Error, name: &str) -> Error {
 /// Translate a `404` on a version-level resource into a version-level error.
 fn missing_version(err: Error, name: &str, version: &str) -> Error {
     match err {
-        Error::Upstream { status: 404, .. } => Error::VersionNotFound {
-            name: name.to_owned(),
-            selector: version.to_owned(),
+        Error::Upstream { status: 404, .. } => {
+            Error::VersionNotFound { name: name.to_owned(), selector: version.to_owned() }
         },
         other => other,
     }
@@ -336,25 +322,16 @@ mod tests {
 
     #[test]
     fn a_client_requires_a_user_agent() {
-        assert!(matches!(
-            Client::new(Config::new("   ")),
-            Err(Error::InvalidArgument(_))
-        ));
+        assert!(matches!(Client::new(Config::new("   ")), Err(Error::InvalidArgument(_))));
         assert!(Client::new(Config::new("mcp-crates/0.1 (https://example.invalid)")).is_ok());
     }
 
     #[test]
     fn not_found_is_reported_against_the_thing_that_was_missing() {
-        let upstream = || Error::Upstream {
-            url: "https://crates.io/x".to_owned(),
-            status: 404,
-            detail: None,
-        };
+        let upstream =
+            || Error::Upstream { url: "https://crates.io/x".to_owned(), status: 404, detail: None };
 
-        assert!(matches!(
-            missing_crate(upstream(), "serde"),
-            Error::CrateNotFound { .. }
-        ));
+        assert!(matches!(missing_crate(upstream(), "serde"), Error::CrateNotFound { .. }));
         assert!(matches!(
             missing_version(upstream(), "serde", "9.9.9"),
             Error::VersionNotFound { .. }
@@ -367,11 +344,8 @@ mod tests {
 
     #[test]
     fn errors_other_than_not_found_pass_through_unchanged() {
-        let server_error = Error::Upstream {
-            url: "https://crates.io/x".to_owned(),
-            status: 503,
-            detail: None,
-        };
+        let server_error =
+            Error::Upstream { url: "https://crates.io/x".to_owned(), status: 503, detail: None };
         assert!(matches!(
             missing_crate(server_error, "serde"),
             Error::Upstream { status: 503, .. }

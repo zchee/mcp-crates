@@ -43,24 +43,10 @@ mod tests {
     #[test]
     fn error_categories_map_onto_json_rpc_codes() {
         let cases = [
+            (Error::InvalidCrateName { name: "bad name".into() }, ErrorCode::INVALID_PARAMS),
+            (Error::CrateNotFound { name: "nope".into() }, ErrorCode::RESOURCE_NOT_FOUND),
             (
-                Error::InvalidCrateName {
-                    name: "bad name".into(),
-                },
-                ErrorCode::INVALID_PARAMS,
-            ),
-            (
-                Error::CrateNotFound {
-                    name: "nope".into(),
-                },
-                ErrorCode::RESOURCE_NOT_FOUND,
-            ),
-            (
-                Error::Upstream {
-                    url: "https://crates.io".into(),
-                    status: 500,
-                    detail: None,
-                },
+                Error::Upstream { url: "https://crates.io".into(), status: 500, detail: None },
                 ErrorCode::INTERNAL_ERROR,
             ),
         ];
@@ -71,11 +57,7 @@ mod tests {
 
     #[test]
     fn the_payload_carries_a_stable_discriminant_and_retry_hint() {
-        let err = Error::Upstream {
-            url: "https://crates.io".into(),
-            status: 503,
-            detail: None,
-        };
+        let err = Error::Upstream { url: "https://crates.io".into(), status: 503, detail: None };
         let data = to_error_data(&err).data.expect("payload present");
 
         assert_eq!(data["kind"], "upstream_error");
@@ -84,9 +66,7 @@ mod tests {
 
     #[test]
     fn a_missing_crate_is_not_advertised_as_retryable() {
-        let err = Error::CrateNotFound {
-            name: "nope".into(),
-        };
+        let err = Error::CrateNotFound { name: "nope".into() };
         let data = to_error_data(&err).data.expect("payload present");
 
         assert_eq!(data["kind"], "crate_not_found");

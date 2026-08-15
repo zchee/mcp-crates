@@ -149,11 +149,8 @@ impl IndexEntry {
     /// crate look like it is missing features that it does in fact have.
     #[must_use]
     pub fn all_features(&self) -> BTreeMap<&str, &[String]> {
-        let mut merged: BTreeMap<&str, &[String]> = self
-            .features
-            .iter()
-            .map(|(name, values)| (name.as_str(), values.as_slice()))
-            .collect();
+        let mut merged: BTreeMap<&str, &[String]> =
+            self.features.iter().map(|(name, values)| (name.as_str(), values.as_slice())).collect();
         if let Some(extra) = &self.features2 {
             for (name, values) in extra {
                 merged.insert(name.as_str(), values.as_slice());
@@ -305,16 +302,8 @@ impl CrateIndex {
 pub fn validate_name(name: &str) -> Result<()> {
     let valid = !name.is_empty()
         && name.len() <= MAX_NAME_LEN
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-    if valid {
-        Ok(())
-    } else {
-        Err(Error::InvalidCrateName {
-            name: name.to_owned(),
-        })
-    }
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if valid { Ok(()) } else { Err(Error::InvalidCrateName { name: name.to_owned() }) }
 }
 
 /// The sparse-index path for a crate, following Cargo's directory layout.
@@ -377,25 +366,12 @@ mod tests {
         assert_eq!(index_path("log").expect("valid"), "3/l/log");
         assert_eq!(index_path("serde").expect("valid"), "se/rd/serde");
         assert_eq!(index_path("tokio-util").expect("valid"), "to/ki/tokio-util");
-        assert_eq!(
-            index_path("SERDE").expect("valid"),
-            "se/rd/serde",
-            "lookups are lowercase"
-        );
+        assert_eq!(index_path("SERDE").expect("valid"), "se/rd/serde", "lookups are lowercase");
     }
 
     #[test]
     fn names_that_could_escape_the_path_are_rejected() {
-        for bad in [
-            "",
-            "../../etc/passwd",
-            "a/b",
-            "sé rde",
-            "a%2e",
-            ".",
-            "..",
-            &"x".repeat(65),
-        ] {
+        for bad in ["", "../../etc/passwd", "a/b", "sé rde", "a%2e", ".", "..", &"x".repeat(65)] {
             assert!(
                 matches!(index_path(bad), Err(Error::InvalidCrateName { .. })),
                 "{bad:?} should have been rejected"
@@ -423,13 +399,8 @@ mod tests {
     #[test]
     fn resolving_the_default_selector_prefers_the_newest_stable_release() {
         let index = sample();
-        let selected = index
-            .resolve(&crate::version::Selector::Default, false)
-            .expect("resolves");
-        assert_eq!(
-            selected.vers, "1.0.0",
-            "a release candidate is not the default version"
-        );
+        let selected = index.resolve(&crate::version::Selector::Default, false).expect("resolves");
+        assert_eq!(selected.vers, "1.0.0", "a release candidate is not the default version");
     }
 
     #[test]
@@ -443,22 +414,15 @@ mod tests {
     #[test]
     fn dependencies_carry_their_kind_and_feature_selection() {
         let index = sample();
-        let release = index
-            .entries()
-            .iter()
-            .find(|entry| entry.vers == "1.0.0")
-            .expect("the release exists");
+        let release =
+            index.entries().iter().find(|entry| entry.vers == "1.0.0").expect("the release exists");
 
-        let normal: Vec<&str> = release
-            .deps_of_kind(DependencyKind::Normal)
-            .map(|dep| dep.name.as_str())
-            .collect();
+        let normal: Vec<&str> =
+            release.deps_of_kind(DependencyKind::Normal).map(|dep| dep.name.as_str()).collect();
         assert_eq!(normal, ["serde"]);
 
-        let dev: Vec<&str> = release
-            .deps_of_kind(DependencyKind::Dev)
-            .map(|dep| dep.name.as_str())
-            .collect();
+        let dev: Vec<&str> =
+            release.deps_of_kind(DependencyKind::Dev).map(|dep| dep.name.as_str()).collect();
         assert_eq!(dev, ["tempfile"]);
 
         let serde = &release.deps[0];
@@ -470,16 +434,10 @@ mod tests {
     #[test]
     fn the_split_feature_tables_are_presented_as_one() {
         let index = sample();
-        let release = index
-            .entries()
-            .iter()
-            .find(|entry| entry.vers == "1.0.0")
-            .expect("the release exists");
+        let release =
+            index.entries().iter().find(|entry| entry.vers == "1.0.0").expect("the release exists");
         let features = release.all_features();
-        assert_eq!(
-            features.keys().copied().collect::<Vec<_>>(),
-            ["json", "std"]
-        );
+        assert_eq!(features.keys().copied().collect::<Vec<_>>(), ["json", "std"]);
     }
 
     #[test]
@@ -491,9 +449,6 @@ mod tests {
 
     #[test]
     fn an_empty_document_is_a_decode_error_rather_than_an_empty_crate() {
-        assert!(matches!(
-            CrateIndex::parse("demo", b""),
-            Err(Error::Decode { .. })
-        ));
+        assert!(matches!(CrateIndex::parse("demo", b""), Err(Error::Decode { .. })));
     }
 }

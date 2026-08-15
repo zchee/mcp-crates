@@ -39,12 +39,7 @@ impl Server {
 
         let stdin = child.stdin.take().expect("stdin is piped");
         let stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
-        let mut server = Self {
-            child,
-            stdin,
-            stdout,
-            next_id: 1,
-        };
+        let mut server = Self { child, stdin, stdout, next_id: 1 };
 
         let initialized = server
             .request(
@@ -75,14 +70,8 @@ impl Server {
             &json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
         )
         .expect("the request serializes");
-        self.stdin
-            .write_all(line.as_bytes())
-            .await
-            .expect("the request is written");
-        self.stdin
-            .write_all(b"\n")
-            .await
-            .expect("the newline is written");
+        self.stdin.write_all(line.as_bytes()).await.expect("the request is written");
+        self.stdin.write_all(b"\n").await.expect("the newline is written");
         self.stdin.flush().await.expect("the request is flushed");
 
         let mut reply = String::new();
@@ -90,16 +79,10 @@ impl Server {
             .await
             .expect("the server replies before the timeout")
             .expect("the reply is readable");
-        assert!(
-            !reply.is_empty(),
-            "the server closed the connection instead of replying"
-        );
+        assert!(!reply.is_empty(), "the server closed the connection instead of replying");
 
         let mut message: Value = serde_json::from_str(&reply).expect("the reply is JSON");
-        assert_eq!(
-            message["id"], id,
-            "replies arrive in order on a single stream"
-        );
+        assert_eq!(message["id"], id, "replies arrive in order on a single stream");
         if let Some(error) = message.get_mut("error") {
             return Err(error.take());
         }
@@ -115,24 +98,14 @@ impl Server {
     async fn notify(&mut self, method: &str) {
         let line = serde_json::to_string(&json!({"jsonrpc": "2.0", "method": method}))
             .expect("the notification serializes");
-        self.stdin
-            .write_all(line.as_bytes())
-            .await
-            .expect("the notification is written");
-        self.stdin
-            .write_all(b"\n")
-            .await
-            .expect("the newline is written");
-        self.stdin
-            .flush()
-            .await
-            .expect("the notification is flushed");
+        self.stdin.write_all(line.as_bytes()).await.expect("the notification is written");
+        self.stdin.write_all(b"\n").await.expect("the newline is written");
+        self.stdin.flush().await.expect("the notification is flushed");
     }
 
     /// Invoke a tool.
     async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, Value> {
-        self.call("tools/call", json!({"name": name, "arguments": arguments}))
-            .await
+        self.call("tools/call", json!({"name": name, "arguments": arguments})).await
     }
 
     /// Close stdin and wait for the server to exit.
@@ -150,10 +123,7 @@ impl Server {
 async fn the_server_advertises_exactly_the_documented_tools() {
     let mut server = Server::start().await;
 
-    let result = server
-        .request("tools/list", json!({}))
-        .await
-        .expect("tools/list succeeds");
+    let result = server.request("tools/list", json!({})).await.expect("tools/list succeeds");
     let mut names: Vec<&str> = result["tools"]
         .as_array()
         .expect("tools is an array")
@@ -180,17 +150,12 @@ async fn the_server_advertises_exactly_the_documented_tools() {
 async fn every_tool_documents_its_arguments() {
     let mut server = Server::start().await;
 
-    let result = server
-        .request("tools/list", json!({}))
-        .await
-        .expect("tools/list succeeds");
+    let result = server.request("tools/list", json!({})).await.expect("tools/list succeeds");
     for tool in result["tools"].as_array().expect("tools is an array") {
         let name = tool["name"].as_str().expect("each tool is named");
 
         assert!(
-            tool["description"]
-                .as_str()
-                .is_some_and(|text| text.len() > 40),
+            tool["description"].as_str().is_some_and(|text| text.len() > 40),
             "{name} needs a description a model can choose from"
         );
 
@@ -199,9 +164,8 @@ async fn every_tool_documents_its_arguments() {
 
         // A description on every property is what lets a model fill arguments
         // in without guessing.
-        for (property, definition) in schema["properties"]
-            .as_object()
-            .expect("properties is an object")
+        for (property, definition) in
+            schema["properties"].as_object().expect("properties is an object")
         {
             assert!(
                 definition.get("description").is_some_and(Value::is_string),
@@ -217,10 +181,7 @@ async fn every_tool_documents_its_arguments() {
 async fn the_crate_name_is_required_by_the_schema_of_every_lookup_tool() {
     let mut server = Server::start().await;
 
-    let result = server
-        .request("tools/list", json!({}))
-        .await
-        .expect("tools/list succeeds");
+    let result = server.request("tools/list", json!({})).await.expect("tools/list succeeds");
     for tool in result["tools"].as_array().expect("tools is an array") {
         let name = tool["name"].as_str().expect("each tool is named");
         if name == "search_crates" {
@@ -232,11 +193,7 @@ async fn the_crate_name_is_required_by_the_schema_of_every_lookup_tool() {
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        assert_eq!(
-            required,
-            ["name"],
-            "{name} should require only the crate name"
-        );
+        assert_eq!(required, ["name"], "{name} should require only the crate name");
     }
 
     server.shutdown().await;
@@ -254,14 +211,8 @@ async fn a_malformed_crate_name_is_rejected_without_contacting_the_registry() {
             .await
             .expect_err("a malformed name is rejected");
 
-        assert_eq!(
-            error["code"], -32602,
-            "{name:?} should be an invalid-params error: {error}"
-        );
-        assert_eq!(
-            error["data"]["kind"], "invalid_crate_name",
-            "{name:?}: {error}"
-        );
+        assert_eq!(error["code"], -32602, "{name:?} should be an invalid-params error: {error}");
+        assert_eq!(error["data"]["kind"], "invalid_crate_name", "{name:?}: {error}");
         assert_eq!(error["data"]["retryable"], false, "{name:?}: {error}");
     }
 
@@ -273,10 +224,7 @@ async fn an_unparsable_version_requirement_is_rejected_before_any_request() {
     let mut server = Server::start().await;
 
     let error = server
-        .call_tool(
-            "get_crate_dependencies",
-            json!({"name": "serde", "version": "not a version"}),
-        )
+        .call_tool("get_crate_dependencies", json!({"name": "serde", "version": "not a version"}))
         .await
         .expect_err("a malformed requirement is rejected");
 

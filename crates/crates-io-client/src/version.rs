@@ -51,12 +51,10 @@ impl FromStr for Selector {
         if let Ok(version) = Version::parse(trimmed) {
             return Ok(Self::Exact(version));
         }
-        VersionReq::parse(trimmed)
-            .map(Self::Matching)
-            .map_err(|err| Error::InvalidVersion {
-                value: trimmed.to_owned(),
-                reason: err.to_string(),
-            })
+        VersionReq::parse(trimmed).map(Self::Matching).map_err(|err| Error::InvalidVersion {
+            value: trimmed.to_owned(),
+            reason: err.to_string(),
+        })
     }
 }
 
@@ -117,9 +115,7 @@ mod tests {
     use super::*;
 
     fn versions(raw: &[(&str, bool)]) -> Vec<(Version, bool)> {
-        raw.iter()
-            .map(|(v, yanked)| (Version::parse(v).expect("valid semver"), *yanked))
-            .collect()
+        raw.iter().map(|(v, yanked)| (Version::parse(v).expect("valid semver"), *yanked)).collect()
     }
 
     fn pick(raw: &[(&str, bool)], selector: &str, allow_yanked: bool) -> Option<String> {
@@ -132,30 +128,15 @@ mod tests {
     #[test]
     fn selectors_parse_into_the_intended_shape() {
         assert_eq!(Selector::from_str("").expect("parses"), Selector::Default);
-        assert_eq!(
-            Selector::from_str("latest").expect("parses"),
-            Selector::Default
-        );
-        assert_eq!(
-            Selector::from_str("LATEST").expect("parses"),
-            Selector::Default
-        );
+        assert_eq!(Selector::from_str("latest").expect("parses"), Selector::Default);
+        assert_eq!(Selector::from_str("LATEST").expect("parses"), Selector::Default);
         assert_eq!(
             Selector::from_str("1.2.3").expect("parses"),
             Selector::Exact(Version::parse("1.2.3").expect("valid"))
         );
-        assert!(matches!(
-            Selector::from_str("^1.2").expect("parses"),
-            Selector::Matching(_)
-        ));
-        assert!(matches!(
-            Selector::from_str("1.*").expect("parses"),
-            Selector::Matching(_)
-        ));
-        assert!(matches!(
-            Selector::from_str("not a version"),
-            Err(Error::InvalidVersion { .. })
-        ));
+        assert!(matches!(Selector::from_str("^1.2").expect("parses"), Selector::Matching(_)));
+        assert!(matches!(Selector::from_str("1.*").expect("parses"), Selector::Matching(_)));
+        assert!(matches!(Selector::from_str("not a version"), Err(Error::InvalidVersion { .. })));
     }
 
     #[test]
@@ -174,10 +155,7 @@ mod tests {
     #[test]
     fn a_prerelease_wins_when_it_is_all_that_exists() {
         let releases = [("0.1.0-alpha.1", false), ("0.1.0-alpha.2", false)];
-        assert_eq!(
-            pick(&releases, "latest", false).as_deref(),
-            Some("0.1.0-alpha.2")
-        );
+        assert_eq!(pick(&releases, "latest", false).as_deref(), Some("0.1.0-alpha.2"));
     }
 
     #[test]

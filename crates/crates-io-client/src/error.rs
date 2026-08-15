@@ -211,15 +211,11 @@ mod tests {
 
     #[test]
     fn categories_match_the_variant_intent() {
-        let invalid = Error::InvalidCrateName {
-            name: "not a crate".into(),
-        };
+        let invalid = Error::InvalidCrateName { name: "not a crate".into() };
         assert_eq!(invalid.category(), Category::InvalidInput);
         assert!(!invalid.retryable());
 
-        let missing = Error::CrateNotFound {
-            name: "nope".into(),
-        };
+        let missing = Error::CrateNotFound { name: "nope".into() };
         assert_eq!(missing.category(), Category::NotFound);
 
         let flaky = Error::Upstream {
@@ -236,19 +232,12 @@ mod tests {
             ceiling_ms: 30_000,
         };
         assert!(shed.retryable(), "the caller may retry after a pause");
-        assert!(
-            !shed.is_transient(),
-            "an immediate in-process retry would be shed again"
-        );
+        assert!(!shed.is_transient(), "an immediate in-process retry would be shed again");
     }
 
     #[test]
     fn upstream_detail_is_appended_only_when_present() {
-        let bare = Error::Upstream {
-            url: "https://x.invalid".into(),
-            status: 500,
-            detail: None,
-        };
+        let bare = Error::Upstream { url: "https://x.invalid".into(), status: 500, detail: None };
         assert_eq!(bare.to_string(), "https://x.invalid returned HTTP 500");
 
         let detailed = Error::Upstream {
@@ -256,9 +245,6 @@ mod tests {
             status: 404,
             detail: Some("Not Found".into()),
         };
-        assert_eq!(
-            detailed.to_string(),
-            "https://x.invalid returned HTTP 404: Not Found"
-        );
+        assert_eq!(detailed.to_string(), "https://x.invalid returned HTTP 404: Not Found");
     }
 }

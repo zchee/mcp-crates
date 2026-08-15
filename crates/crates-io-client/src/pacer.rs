@@ -112,9 +112,8 @@ impl Pacer {
     /// Every caller that has not yet been served is delayed, and slots already
     /// claimed further in the future are left untouched.
     pub fn penalize(&self, backoff: Duration) {
-        let target = self
-            .now_nanos()
-            .saturating_add(u64::try_from(backoff.as_nanos()).unwrap_or(u64::MAX));
+        let target =
+            self.now_nanos().saturating_add(u64::try_from(backoff.as_nanos()).unwrap_or(u64::MAX));
         self.next_slot_nanos.fetch_max(target, Ordering::AcqRel);
     }
 
@@ -159,10 +158,7 @@ mod tests {
 
         // The fourth would land at t=3, one second past the ceiling.
         let err = pacer.reserve().expect_err("queue is saturated");
-        assert!(
-            matches!(err, crate::Error::RateLimitQueueFull { .. }),
-            "got {err:?}"
-        );
+        assert!(matches!(err, crate::Error::RateLimitQueueFull { .. }), "got {err:?}");
     }
 
     #[tokio::test(start_paused = true)]
