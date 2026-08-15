@@ -1,0 +1,42 @@
+[package]
+name = "mcp-crates"
+version = "0.1.0"
+description = "Model Context Protocol server for the crates.io registry"
+keywords = ["mcp", "crates-io", "registry", "cargo", "llm"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "mcp-crates"
+path = "src/main.rs"
+
+[dependencies]
+crates-io-client.workspace = true
+
+clap.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std", "signal"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "test-util",
+    "process",
+    "io-util",
+] }
+
+[lints]
+workspace = true
