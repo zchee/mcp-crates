@@ -83,8 +83,9 @@ impl Config {
 /// Anything addressed by an exact version is immutable once published, so it is
 /// held for a long time; anything reflecting live registry state is held only
 /// briefly, and revalidated cheaply where the origin supplies a validator.
+// Not `#[non_exhaustive]`: this exists to be constructed by a caller adjusting
+// one lifetime, which the attribute would make impossible from outside.
 #[derive(Clone, Copy, Debug)]
-#[non_exhaustive]
 pub struct Ttl {
     /// Search results and other list endpoints.
     pub search: Duration,

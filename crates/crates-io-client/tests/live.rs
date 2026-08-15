@@ -24,7 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crates_io_client::{Client, Config, Include, SearchParams, Selector};
+use crates_io_client::{Client, Config, Include, SearchParams, Selector, Ttl};
 
 /// Identifies these tests to crates.io, as its crawler policy requires.
 const USER_AGENT: &str =
@@ -49,6 +49,7 @@ async fn the_live_registry_behaves_as_this_crate_expects() {
     repeated_questions_cost_nothing(&client).await;
     concurrent_questions_share_one_request(&client).await;
     api_requests_are_paced(&client).await;
+    a_stale_copy_is_revalidated_rather_than_refetched().await;
 
     let stats = client.stats();
     eprintln!(
@@ -195,6 +196,33 @@ async fn concurrent_questions_share_one_request(client: &Arc<Client>) {
         "eight concurrent callers should share one request"
     );
     assert!(client.stats().coalesced >= 7, "seven of the eight should have been coalesced");
+}
+
+/// The sparse index carries an `ETag`, so a stale copy should cost a
+/// conditional request that transfers no body.
+///
+/// This needs its own client: the shared one holds the index for ten minutes,
+/// which no test wants to wait out.
+async fn a_stale_copy_is_revalidated_rather_than_refetched() {
+    let ttl = Ttl { index: Duration::from_millis(1), ..Ttl::default() };
+    let client = Client::with_ttl(Config::new(USER_AGENT), ttl).expect("the client builds");
+
+    client.index("libc").await.expect("libc is indexed");
+    let after_first = client.stats();
+    assert_eq!(after_first.not_modified, 0, "the first fetch cannot be a revalidation");
+
+    // Outlive the millisecond lifetime, so the next read finds a stale entry
+    // holding a validator.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let revalidated = client.index("libc").await.expect("libc is still indexed");
+
+    let after_second = client.stats();
+    assert_eq!(after_second.not_modified, 1, "the stale copy should have been revalidated");
+    assert_eq!(
+        after_second.bytes_received, after_first.bytes_received,
+        "a 304 transfers headers, not a body"
+    );
+    assert!(!revalidated.is_empty(), "the revalidated copy is still usable");
 }
 
 async fn api_requests_are_paced(client: &Client) {

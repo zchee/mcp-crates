@@ -161,8 +161,9 @@ impl Counters {
 enum Wire {
     /// A body was transferred.
     Body(CachedBody),
-    /// The origin confirmed the cached copy is still current.
-    NotModified,
+    /// The origin confirmed the cached copy is still current, and said how long
+    /// the refreshed copy may be served for.
+    NotModified(Duration),
 }
 
 /// The shared HTTP layer.
@@ -290,14 +291,14 @@ impl Fetcher {
         let validators = stale.as_deref().filter(|e| e.status < 300 && e.has_validator());
         let entry = match self.fetch_with_retry(url, validators, policy).await? {
             Wire::Body(body) => Arc::new(body),
-            Wire::NotModified => {
+            Wire::NotModified(ttl) => {
                 self.counters.not_modified.fetch_add(1, Ordering::Relaxed);
                 let previous = stale.as_deref().ok_or_else(|| Error::Upstream {
                     url: url.to_owned(),
                     status: 304,
                     detail: Some("the origin sent 304 without a cached copy to refresh".to_owned()),
                 })?;
-                Arc::new(previous.revalidated(policy.ttl))
+                Arc::new(previous.revalidated(ttl))
             },
         };
 
@@ -404,7 +405,12 @@ impl Fetcher {
 
             let status = response.status();
             if status == StatusCode::NOT_MODIFIED {
-                return Ok(Wire::NotModified);
+                // A 304 carries its own caching directives, and they govern
+                // the refreshed copy just as they would a transferred one.
+                // Reusing the configured lifetime here instead would let a
+                // revalidation grant an origin that asked for no caching at
+                // all a full lifetime.
+                return Ok(Wire::NotModified(effective_ttl(policy.ttl, response.headers())));
             }
 
             if status.is_redirection() {
