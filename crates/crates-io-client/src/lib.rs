@@ -64,13 +64,16 @@ mod version;
 
 // Reachable so that `benches/hot_paths.rs`, which links this crate as an
 // ordinary dependency, can time the two functions the rest of the API only
-// reaches through a network fetch: `docs::decompress_rustdoc` and
-// `readme::to_markdown`. Hidden because the supported surface is still the
+// reaches through a network fetch — `docs::decompress_rustdoc` and
+// `readme::to_markdown` — and can generate the oversized document that both it
+// and the parity suite need. Hidden because the supported surface is still the
 // re-exports below, which is where the documentation lives.
 #[doc(hidden)]
 pub mod docs;
 #[doc(hidden)]
 pub mod readme;
+#[doc(hidden)]
+pub mod synthetic;
 
 use std::{sync::Arc, time::Duration};
 
@@ -177,7 +180,7 @@ impl Client {
         let body =
             self.fetcher.get(&url, Policy::cached(self.ttl.search, self.ttl.negative)).await?;
         body.derive(|bytes| {
-            serde_json::from_slice::<SearchResponse>(bytes)
+            sonic_rs::from_slice::<SearchResponse>(bytes)
                 .map_err(|err| Error::Decode { url: url.clone(), message: err.to_string() })
         })
     }
@@ -195,7 +198,7 @@ impl Client {
             .await
             .map_err(|err| missing_crate(err, name))?;
         body.derive(|bytes| {
-            serde_json::from_slice::<CrateResponse>(bytes)
+            sonic_rs::from_slice::<CrateResponse>(bytes)
                 .map_err(|err| Error::Decode { url: url.clone(), message: err.to_string() })
         })
     }
@@ -269,7 +272,7 @@ impl Client {
                 missing_docs(err, name, version, "docs.rs has no record of this release")
             })?;
         body.derive(|bytes| {
-            serde_json::from_slice::<BuildStatus>(bytes)
+            sonic_rs::from_slice::<BuildStatus>(bytes)
                 .map_err(|err| Error::Decode { url: url.clone(), message: err.to_string() })
         })
     }

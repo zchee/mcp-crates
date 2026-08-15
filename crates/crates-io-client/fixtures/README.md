@@ -1,7 +1,9 @@
 # Benchmark fixtures
 
 Real documents, captured once and committed, so that a benchmark run measures
-this crate's parsing and lookup code rather than the network. Each one is
+this crate's parsing and lookup code rather than the network, and so that the
+differential parity suite in `src/docs.rs` and `src/index.rs` has real payloads
+to compare two deserializers over. Each one is
 immutable at its source — a published version's rustdoc JSON and rendered README
 never change — so a captured copy stays a faithful sample indefinitely.
 
@@ -36,8 +38,8 @@ is the real one. `regex` expands from 122 KB to 1.35 MB, `semver` from 48 KB to
 The item counts are low relative to the document size because rustdoc's `paths`
 table mostly names *foreign* items, which the index discards. No real crate of a
 size worth committing reaches the 50 000-item ceiling the lookup path is bounded
-by, which is why `hot_paths.rs` generates a synthetic document of that size in
-code rather than storing one here.
+by, which is why `src/synthetic.rs` generates a document of that size in code
+rather than storing one here; the benchmark and the parity suite share it.
 
 ## The other two
 

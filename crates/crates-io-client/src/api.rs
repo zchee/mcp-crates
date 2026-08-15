@@ -165,7 +165,7 @@ impl SearchParams {
 }
 
 /// Crate-level metadata, as crates.io reports it.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub struct CrateSummary {
     /// The crate name.
@@ -224,7 +224,7 @@ pub struct CrateSummary {
 }
 
 /// Pagination metadata attached to a search response.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub struct SearchMeta {
     /// Total number of matching crates.
@@ -239,7 +239,7 @@ pub struct SearchMeta {
 }
 
 /// A crates.io search response.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub struct SearchResponse {
     /// The matching crates, in the requested order.
@@ -251,7 +251,7 @@ pub struct SearchResponse {
 }
 
 /// A keyword, with how many crates carry it.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub struct Keyword {
     /// The keyword itself.
@@ -262,7 +262,7 @@ pub struct Keyword {
 }
 
 /// A category, with how many crates belong to it.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub struct Category {
     /// The human-readable category name.
@@ -278,7 +278,7 @@ pub struct Category {
 }
 
 /// A crates.io crate detail response.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub struct CrateResponse {
     /// The crate metadata.
@@ -456,6 +456,100 @@ mod tests {
         ));
         let url = crate_url("serde", Include::default()).expect("builds");
         assert!(url.starts_with("https://crates.io/api/v1/crates/serde?include="), "{url}");
+    }
+
+    /// A search response shaped like the one crates.io returns: two results,
+    /// one exact match, a full metadata block on the first and a sparse one on
+    /// the second, and fields this crate does not model.
+    const SEARCH: &str = r#"{
+        "crates": [
+            {
+                "name": "serde", "description": "A generic serialization framework",
+                "max_version": "1.0.229", "max_stable_version": "1.0.229",
+                "newest_version": "1.0.229", "default_version": "1.0.229",
+                "downloads": 712345678, "recent_downloads": 91234567, "num_versions": 316,
+                "repository": "https://github.com/serde-rs/serde",
+                "homepage": "https://serde.rs", "documentation": "https://docs.rs/serde",
+                "keywords": ["serde", "serialization", "no_std"],
+                "categories": ["encoding", "no-std"],
+                "created_at": "2014-12-05T20:20:39.487235+00:00",
+                "updated_at": "2026-08-01T09:10:11.000000+00:00",
+                "yanked": false, "exact_match": true,
+                "links": {"owners": "/api/v1/crates/serde/owners"}, "id": "serde"
+            },
+            {
+                "name": "serde_json", "description": null, "downloads": 0,
+                "recent_downloads": null, "yanked": true, "exact_match": false
+            }
+        ],
+        "meta": {"total": 2847, "next_page": "?page=2&q=serde", "prev_page": null}
+    }"#;
+
+    /// A crate detail response with both optional sections present.
+    const CRATE: &str = r#"{
+        "crate": {
+            "name": "tokio", "description": "An event-driven runtime",
+            "max_version": "1.44.2", "max_stable_version": "1.44.2",
+            "newest_version": "1.44.2", "default_version": "1.44.2",
+            "downloads": 512345678, "recent_downloads": 45678901, "num_versions": 271,
+            "repository": "https://github.com/tokio-rs/tokio", "homepage": null,
+            "documentation": null, "keywords": ["io", "async"],
+            "categories": ["asynchronous", "network-programming"],
+            "created_at": "2016-08-05T00:00:00+00:00",
+            "updated_at": "2026-04-01T00:00:00+00:00", "yanked": false
+        },
+        "keywords": [{"keyword": "io", "crates_cnt": 1234}, {"keyword": "async", "crates_cnt": 99}],
+        "categories": [
+            {"category": "Asynchronous", "slug": "asynchronous",
+             "description": "Crates for async work", "crates_cnt": 4321},
+            {"category": "Network programming", "slug": "network-programming",
+             "description": null, "crates_cnt": 0}
+        ],
+        "versions": []
+    }"#;
+
+    #[test]
+    fn both_deserializers_agree_on_the_api_responses() {
+        // These two types are what a caller of `search` and `crate_info`
+        // receives, so a field one deserializer drops and the other keeps is a
+        // field that silently stops reaching consumers. Both derive
+        // `PartialEq`, which makes the comparison total rather than a list of
+        // fields someone has to keep in step.
+        let search_shipped = sonic_rs::from_str::<SearchResponse>(SEARCH).expect("shipped reads");
+        let search_referee = serde_json::from_str::<SearchResponse>(SEARCH).expect("referee reads");
+        assert_eq!(search_shipped.crates.len(), 2, "the fixture has two results");
+        assert_eq!(search_shipped, search_referee, "search response");
+
+        let crate_shipped = sonic_rs::from_str::<CrateResponse>(CRATE).expect("shipped reads");
+        let crate_referee = serde_json::from_str::<CrateResponse>(CRATE).expect("referee reads");
+        assert_eq!(crate_shipped.keywords.as_ref().map(Vec::len), Some(2), "keywords decoded");
+        assert_eq!(crate_shipped, crate_referee, "crate response");
+    }
+
+    #[test]
+    fn the_api_fixtures_decode_the_values_they_carry() {
+        // A parity test passes just as well when both parsers return an empty
+        // response, so the corpus has to be shown to carry something.
+        let search = sonic_rs::from_str::<SearchResponse>(SEARCH).expect("reads");
+        let first = &search.crates[0];
+        assert_eq!(first.name, "serde");
+        assert!(first.exact_match);
+        assert_eq!(first.num_versions, Some(316));
+        assert_eq!(
+            first.keywords.as_deref(),
+            Some(&["serde".to_owned(), "serialization".to_owned(), "no_std".to_owned()][..])
+        );
+        assert_eq!(search.meta.total, 2847);
+        assert_eq!(search.meta.next_page.as_deref(), Some("?page=2&q=serde"));
+
+        let second = &search.crates[1];
+        assert_eq!(second.description, None, "an explicit null stays absent");
+        assert!(second.yanked);
+        assert_eq!(second.num_versions, None, "an omitted field stays absent");
+
+        let detail = sonic_rs::from_str::<CrateResponse>(CRATE).expect("reads");
+        assert_eq!(detail.krate.name, "tokio", "the renamed `crate` field is read");
+        assert_eq!(detail.categories.as_ref().expect("present")[0].crates_cnt, 4321);
     }
 
     #[test]

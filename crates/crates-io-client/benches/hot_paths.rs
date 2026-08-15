@@ -1,8 +1,8 @@
 //! Benchmarks for the CPU-bound paths: decompressing, parsing and looking up.
 //!
 //! Everything here runs against documents captured from docs.rs,
-//! `index.crates.io` and `static.crates.io`; `fixtures/README.md` records what
-//! each one is and where it came from. Nothing contacts the network, and no
+//! `index.crates.io` and `static.crates.io`; `../fixtures/README.md` records
+//! what each one is and where it came from. Nothing contacts the network, and no
 //! fixture is a hand-written approximation of a real payload.
 //!
 //! Two of the groups run against a document generated in code rather than a
@@ -14,9 +14,9 @@
 //! Run with `cargo bench -p crates-io-client`, never concurrently with another
 //! build: a benchmark sharing the machine with a linker is measuring the linker.
 
-use std::{fmt::Write as _, sync::LazyLock};
+use std::sync::LazyLock;
 
-use crates_io_client::{CrateIndex, DocIndex, Lookup, docs, readme};
+use crates_io_client::{CrateIndex, DocIndex, Lookup, docs, readme, synthetic};
 
 /// The allocator the server binary installs.
 ///
@@ -95,22 +95,23 @@ impl Rustdoc {
 
 /// `format_version` 55, the older end of what docs.rs currently serves.
 static REGEX: LazyLock<Rustdoc> = LazyLock::new(|| {
-    Rustdoc::load("regex", include_bytes!("fixtures/regex-1.11.1.rustdoc.json.zst"))
+    Rustdoc::load("regex", include_bytes!("../fixtures/regex-1.11.1.rustdoc.json.zst"))
 });
 
 /// `format_version` 60, the newer end.
 static SEMVER: LazyLock<Rustdoc> = LazyLock::new(|| {
-    Rustdoc::load("semver", include_bytes!("fixtures/semver-1.0.28.rustdoc.json.zst"))
+    Rustdoc::load("semver", include_bytes!("../fixtures/semver-1.0.28.rustdoc.json.zst"))
 });
 
 /// The `serde` sparse-index document: 316 versions, one JSON object per line.
-static SERDE_INDEX: &[u8] = include_bytes!("fixtures/serde.index.json");
+static SERDE_INDEX: &[u8] = include_bytes!("../fixtures/serde.index.json");
 
 /// A rendered README, as `static.crates.io` stores it.
-static TOKIO_README: &str = include_str!("fixtures/tokio-1.44.2.readme.html");
+static TOKIO_README: &str = include_str!("../fixtures/tokio-1.44.2.readme.html");
 
 /// A rustdoc document generated to reach the 50 000-item ceiling.
-static SYNTHETIC: LazyLock<String> = LazyLock::new(synthetic_rustdoc);
+static SYNTHETIC: LazyLock<String> =
+    LazyLock::new(|| synthetic::rustdoc_document(synthetic::PATHS_FOR_CEILING));
 
 /// The captured and generated documents parsed once, for the lookup groups,
 /// which are not measuring the parse.
@@ -118,17 +119,6 @@ static REGEX_INDEX: LazyLock<DocIndex> = LazyLock::new(|| REGEX.parse());
 static SYNTHETIC_INDEX: LazyLock<DocIndex> = LazyLock::new(|| {
     DocIndex::parse("synth", SYNTHETIC.as_bytes()).expect("the generator is valid")
 });
-
-/// How many items the generated document declares a canonical path for.
-const SYNTHETIC_PATHS: u32 = 40_000;
-
-/// How many of those share a module. Only the shape matters: a flat crate would
-/// give every path the same length and the same first segments.
-const SYNTHETIC_MODULE_SIZE: u32 = 64;
-
-/// Every fourth generated item owns one inherent method, which is what takes the
-/// total to the 50 000-item ceiling: 40 000 paths plus 10 000 children.
-const SYNTHETIC_OWNER_STRIDE: u32 = 4;
 
 /// The generated item the lookup benchmarks resolve to. Both its bare name and
 /// its two-segment suffix are unique in the document, so each lookup terminates
@@ -142,79 +132,12 @@ const MISS: &str = "zzqxnotpresent";
 
 /// Queries built once, so that the timed region holds a lookup and nothing else.
 static SYNTHETIC_EXACT: LazyLock<String> = LazyLock::new(|| {
-    format!("synth::m{}::Item{SYNTHETIC_TARGET}", SYNTHETIC_TARGET / SYNTHETIC_MODULE_SIZE)
+    format!("synth::m{}::Item{SYNTHETIC_TARGET}", SYNTHETIC_TARGET / synthetic::MODULE_SIZE)
 });
 static SYNTHETIC_SUFFIX: LazyLock<String> = LazyLock::new(|| {
-    format!("m{}::Item{SYNTHETIC_TARGET}", SYNTHETIC_TARGET / SYNTHETIC_MODULE_SIZE)
+    format!("m{}::Item{SYNTHETIC_TARGET}", SYNTHETIC_TARGET / synthetic::MODULE_SIZE)
 });
 static SYNTHETIC_NAME: LazyLock<String> = LazyLock::new(|| format!("item{SYNTHETIC_TARGET}"));
-
-/// Build a rustdoc-shaped document with 50 000 indexable items.
-///
-/// It mirrors the real schema closely enough that the parser does the same work
-/// on it: `paths` holds only items with a canonical path, methods hang off an
-/// inherent impl block their type points at, a share of the entries carry prose,
-/// and a `use` re-exports from a named foreign crate.
-fn synthetic_rustdoc() -> String {
-    // Roughly what the finished document measures; one reservation beats a few
-    // dozen reallocations of a multi-megabyte string.
-    let mut out = String::with_capacity(12 * 1024 * 1024);
-    out.push_str(r#"{"crate_version":"0.1.0","format_version":60,"paths":{"#);
-
-    for id in 0..SYNTHETIC_PATHS {
-        if id > 0 {
-            out.push(',');
-        }
-        let module = id / SYNTHETIC_MODULE_SIZE;
-        let kind = if id % SYNTHETIC_OWNER_STRIDE == 0 { "struct" } else { "function" };
-        let _ = write!(
-            out,
-            r#""{id}":{{"crate_id":0,"path":["synth","m{module}","Item{id}"],"kind":"{kind}"}}"#
-        );
-    }
-    // One foreign item, so the re-export pass has something to resolve.
-    out.push_str(
-        r#","900000":{"crate_id":1,"path":["synth_core","frame","Frame"],"kind":"struct"}"#,
-    );
-    out.push_str(r#"},"external_crates":{"1":{"name":"synth_core"}},"index":{"#);
-    // Emitted first so every entry after it can carry a leading comma.
-    out.push_str(
-        r#""900001":{"inner":{"use":{"source":"synth_core::frame::Frame","name":"Frame","id":900000,"is_glob":false}}}"#,
-    );
-
-    for id in 0..SYNTHETIC_PATHS {
-        if id % SYNTHETIC_OWNER_STRIDE == 0 {
-            // A type, its inherent impl block, and the one method inside it. The
-            // ids are separated by magnitude so they cannot collide with the
-            // path ids above.
-            let impl_id = 1_000_000 + id;
-            let method_id = 2_000_000 + id;
-            let _ = write!(
-                out,
-                r#","{id}":{{"name":"Item{id}","docs":"Item {id} of the generated crate. It carries enough prose for the parser to copy, trim and weigh it.","inner":{{"struct":{{"impls":[{impl_id}]}}}}}}"#
-            );
-            let _ = write!(
-                out,
-                r#","{impl_id}":{{"inner":{{"impl":{{"trait":null,"items":[{method_id}]}}}}}}"#
-            );
-            let _ = write!(
-                out,
-                r#","{method_id}":{{"name":"method{id}","docs":"Does whatever item {id} does.","inner":{{"function":{{}}}}}}"#
-            );
-        } else if id % 2 == 0 {
-            // A documented leaf: no body worth walking, but prose to carry.
-            let _ = write!(
-                out,
-                r#","{id}":{{"name":"Item{id}","docs":"Item {id} of the generated crate.","inner":{{"function":{{}}}}}}"#
-            );
-        }
-        // The rest have no index entry at all, which is the common case in a
-        // real document.
-    }
-
-    out.push_str("}}");
-    out
-}
 
 /// Expanding the document docs.rs transfers.
 #[divan::bench_group]

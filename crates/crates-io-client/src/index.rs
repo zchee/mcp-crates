@@ -47,7 +47,7 @@ impl DependencyKind {
 }
 
 /// One dependency of one published version.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub struct IndexDep {
     /// The name this dependency is known by inside the depending crate. When
@@ -94,7 +94,7 @@ const fn default_true() -> bool {
 }
 
 /// One published version of a crate, as the index describes it.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub struct IndexEntry {
     /// The crate name.
@@ -200,11 +200,10 @@ impl CrateIndex {
             if line.is_empty() {
                 continue;
             }
-            let mut entry: IndexEntry =
-                serde_json::from_str(line).map_err(|err| Error::Decode {
-                    url: index_url(name),
-                    message: format!("line {} is not a valid index entry: {err}", number + 1),
-                })?;
+            let mut entry: IndexEntry = sonic_rs::from_str(line).map_err(|err| Error::Decode {
+                url: index_url(name),
+                message: format!("line {} is not a valid index entry: {err}", number + 1),
+            })?;
             entry.parsed = Version::parse(&entry.vers).ok();
             entries.push(entry);
         }
@@ -472,5 +471,49 @@ mod tests {
     #[test]
     fn an_empty_document_is_a_decode_error_rather_than_an_empty_crate() {
         assert!(matches!(CrateIndex::parse("demo", b""), Err(Error::Decode { .. })));
+    }
+
+    /// The captured `serde` index: 316 published versions, one object per line.
+    const CAPTURED: &str = include_str!("../fixtures/serde.index.json");
+
+    #[test]
+    fn sonic_rs_and_serde_json_decode_identical_index_entries() {
+        // Every field of every version of the crate with the longest release
+        // history in the ecosystem. `IndexEntry` derives `PartialEq`, so this
+        // compares the whole struct rather than a list of fields someone has to
+        // remember to extend — a dependency's `target` expression or a
+        // `features2` table decoded differently would fail here.
+        let documents = [("the captured serde index", CAPTURED), ("the inline sample", SAMPLE)];
+        let mut compared = 0_usize;
+
+        for (label, document) in documents {
+            for (number, line) in document.lines().enumerate() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let shipped: IndexEntry = sonic_rs::from_str(line)
+                    .unwrap_or_else(|err| panic!("{label} line {}: {err}", number + 1));
+                let referee: IndexEntry = serde_json::from_str(line)
+                    .unwrap_or_else(|err| panic!("{label} line {}: {err}", number + 1));
+                assert_eq!(shipped, referee, "{label} line {} decodes differently", number + 1);
+                compared += 1;
+            }
+        }
+
+        assert_eq!(compared, 320, "316 captured versions plus the four inline ones");
+    }
+
+    #[test]
+    fn the_captured_index_parses_and_orders_every_version() {
+        // The per-line comparison above says the two deserializers agree; this
+        // says the shipped one carries a real document all the way through.
+        let index = CrateIndex::parse("serde", CAPTURED.as_bytes()).expect("parses");
+        assert_eq!(index.name(), "serde");
+        assert_eq!(index.len(), 316);
+
+        let ascending: Vec<&Version> = index.ascending().filter_map(IndexEntry::version).collect();
+        assert!(ascending.windows(2).all(|pair| pair[0] <= pair[1]), "versions come out ordered");
+        assert!(index.entries().iter().any(|entry| !entry.deps.is_empty()), "dependencies decoded");
     }
 }

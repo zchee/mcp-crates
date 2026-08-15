@@ -19,7 +19,10 @@ moka.workspace = true
 reqwest.workspace = true
 semver.workspace = true
 serde.workspace = true
+# Retained for the error-detail probe in `fetch.rs`, which stays on it
+# deliberately, and as the referee of the differential parity suite.
 serde_json.workspace = true
+sonic-rs.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

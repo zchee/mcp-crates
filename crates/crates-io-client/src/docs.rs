@@ -41,7 +41,7 @@ const MAX_ITEMS: usize = 50_000;
 type FastMap<K, V> = HashMap<K, V, foldhash::fast::RandomState>;
 
 /// Whether docs.rs managed to build documentation for a release.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub struct BuildStatus {
     /// Whether the documentation build succeeded.
@@ -113,7 +113,7 @@ pub struct Lookup<'a> {
 }
 
 /// A crate's documentation, indexed by item path.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct DocIndex {
     crate_version: Option<String>,
     format_version: Option<u64>,
@@ -278,11 +278,29 @@ impl DocIndex {
     /// Returns [`Error::Decode`] if the document is not rustdoc JSON, or
     /// describes no items belonging to this crate.
     pub fn parse(name: &str, body: &[u8]) -> Result<Self> {
+        let root: RustdocRoot = sonic_rs::from_slice(body).map_err(|err| Error::Decode {
+            url: format!("rustdoc JSON for {name}"),
+            message: err.to_string(),
+        })?;
+        Self::build(name, root)
+    }
+
+    /// The same index, deserialized by `serde_json` instead.
+    ///
+    /// Exists only as the referee of the differential parity suite: everything
+    /// downstream of the deserializer is the shared [`DocIndex::build`] below,
+    /// so a difference between the two can only have come from the parser.
+    #[cfg(test)]
+    fn parse_with_serde_json(name: &str, body: &[u8]) -> Result<Self> {
         let root: RustdocRoot = serde_json::from_slice(body).map_err(|err| Error::Decode {
             url: format!("rustdoc JSON for {name}"),
             message: err.to_string(),
         })?;
+        Self::build(name, root)
+    }
 
+    /// Project a deserialized document down to the index this crate keeps.
+    fn build(name: &str, root: RustdocRoot) -> Result<Self> {
         let mut items: Vec<DocItem> = Vec::new();
         let mut truncated = false;
 
@@ -1002,11 +1020,163 @@ mod tests {
 
     #[test]
     fn an_unrecognised_build_status_is_a_decode_error_not_a_failed_build() {
-        assert!(serde_json::from_str::<BuildStatus>(r#"{"doc_status":true}"#).is_ok());
+        assert!(sonic_rs::from_str::<BuildStatus>(r#"{"doc_status":true}"#).is_ok());
         assert!(
-            serde_json::from_str::<BuildStatus>("{}").is_err(),
+            sonic_rs::from_str::<BuildStatus>("{}").is_err(),
             "an empty object must not read as a failed build"
         );
+    }
+
+    /// One rustdoc document to run both deserializers over.
+    struct ParityCase {
+        /// The crate name, which only reaches error messages.
+        name: &'static str,
+        /// The document, already expanded.
+        body: Vec<u8>,
+        /// How many items the document is expected to contribute. Pinned so
+        /// that a corpus entry silently shrinking to nothing — a fixture
+        /// replaced, a generator changed — cannot turn into a passing test that
+        /// compares almost no items.
+        items: usize,
+        /// How many re-exports, for the same reason.
+        reexports: usize,
+    }
+
+    /// The corpus the differential parity suite runs over.
+    ///
+    /// Two captured documents at opposite ends of the `format_version` range
+    /// docs.rs serves; the inline fixture above, which is the only one carrying
+    /// a macro body that is a string rather than an object and so the only one
+    /// that drives the `ItemBody` visitor down its non-map arms; and a generated
+    /// document at the item ceiling, large enough that one divergent item in
+    /// fifty thousand is still caught.
+    fn parity_corpus() -> [(&'static str, ParityCase); 4] {
+        /// Larger than any corpus entry expands to.
+        const LIMIT: usize = 64 * 1024 * 1024;
+        let expand = |name: &'static str, compressed: &[u8]| {
+            decompress_rustdoc(name, compressed, LIMIT).expect("the committed fixture decompresses")
+        };
+        [
+            (
+                "regex 1.11.1, format_version 55",
+                ParityCase {
+                    name: "regex",
+                    body: expand(
+                        "regex",
+                        include_bytes!("../fixtures/regex-1.11.1.rustdoc.json.zst"),
+                    ),
+                    items: 209,
+                    reexports: 0,
+                },
+            ),
+            (
+                "semver 1.0.28, format_version 60",
+                ParityCase {
+                    name: "semver",
+                    body: expand(
+                        "semver",
+                        include_bytes!("../fixtures/semver-1.0.28.rustdoc.json.zst"),
+                    ),
+                    items: 32,
+                    reexports: 0,
+                },
+            ),
+            (
+                "the inline fixture",
+                ParityCase {
+                    name: "demo",
+                    body: RUSTDOC.as_bytes().to_vec(),
+                    items: 14,
+                    reexports: 1,
+                },
+            ),
+            (
+                "a generated document at the item ceiling",
+                ParityCase {
+                    name: "synth",
+                    body: crate::synthetic::rustdoc_document(crate::synthetic::PATHS_FOR_CEILING)
+                        .into_bytes(),
+                    items: 50_000,
+                    reexports: 1,
+                },
+            ),
+        ]
+    }
+
+    /// Assert that two indexes built from the same bytes agree completely.
+    fn assert_identical(label: &str, shipped: &DocIndex, referee: &DocIndex) {
+        assert_eq!(shipped.crate_version(), referee.crate_version(), "{label}: crate_version");
+        assert_eq!(shipped.format_version(), referee.format_version(), "{label}: format_version");
+        assert_eq!(shipped.is_truncated(), referee.is_truncated(), "{label}: truncated");
+
+        assert_eq!(shipped.len(), referee.len(), "{label}: item count");
+        for (position, (left, right)) in shipped.items().iter().zip(referee.items()).enumerate() {
+            assert_eq!(left, right, "{label}: item {position}");
+        }
+
+        assert_eq!(shipped.reexports().len(), referee.reexports().len(), "{label}: re-exports");
+        for (position, (left, right)) in
+            shipped.reexports().iter().zip(referee.reexports()).enumerate()
+        {
+            assert_eq!(left, right, "{label}: re-export {position}");
+        }
+
+        // The comparisons above exist to make a failure readable: one item
+        // named, not fifty thousand printed. This one exists to make the check
+        // total, so that a field added to `DocIndex` later is compared whether
+        // or not anyone remembers to extend this function.
+        assert!(shipped == referee, "{label}: the indexes differ in a field not named above");
+    }
+
+    #[test]
+    fn sonic_rs_and_serde_json_build_identical_indexes() {
+        // The shipped parser and the referee share everything downstream of the
+        // deserializer, so a difference here can only have come from the
+        // deserializer. Zero divergence is the bar: a document this crate reads
+        // wrongly is documentation reported wrongly, which is worse than
+        // reporting nothing.
+        for (label, case) in parity_corpus() {
+            let shipped = DocIndex::parse(case.name, &case.body).expect("the shipped parser reads");
+            let referee =
+                DocIndex::parse_with_serde_json(case.name, &case.body).expect("the referee reads");
+
+            assert_eq!(shipped.len(), case.items, "{label}: the corpus entry changed size");
+            assert_eq!(shipped.reexports().len(), case.reexports, "{label}: re-export count");
+            assert_identical(label, &shipped, &referee);
+        }
+    }
+
+    #[test]
+    fn parsing_the_same_document_twice_gives_the_same_index() {
+        // What the parity suite above rests on. Items are collected by
+        // iterating a hash map, then sorted by path and deduplicated by path,
+        // so two entries sharing a path would leave the survivor to hash order
+        // — and the parity comparison would be comparing seeds rather than
+        // parsers. This says the corpus has no such collision.
+        for (label, case) in parity_corpus() {
+            let first = DocIndex::parse(case.name, &case.body).expect("parses");
+            let second = DocIndex::parse(case.name, &case.body).expect("parses");
+            assert_identical(label, &first, &second);
+        }
+    }
+
+    #[test]
+    fn both_deserializers_agree_on_a_build_status() {
+        let cases = [
+            ("a successful build", r#"{"doc_status":true,"version":"1.0.0"}"#),
+            ("a failed build", r#"{"doc_status":false,"version":null}"#),
+            ("no version reported", r#"{"doc_status":true}"#),
+            ("unknown fields are ignored", r#"{"doc_status":true,"version":"1.0","extra":[1,2]}"#),
+        ];
+        for (label, document) in cases {
+            let shipped = sonic_rs::from_str::<BuildStatus>(document).expect(label);
+            let referee = serde_json::from_str::<BuildStatus>(document).expect(label);
+            assert_eq!(shipped, referee, "{label}");
+        }
+
+        // And that they agree on rejection, not just on acceptance.
+        assert!(sonic_rs::from_str::<BuildStatus>("{}").is_err());
+        assert!(serde_json::from_str::<BuildStatus>("{}").is_err());
     }
 
     #[test]
