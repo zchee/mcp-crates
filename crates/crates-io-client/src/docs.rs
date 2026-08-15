@@ -29,6 +29,17 @@ const MAX_SUGGESTIONS: usize = 12;
 /// Backstop on how many items one crate may contribute to an index.
 const MAX_ITEMS: usize = 50_000;
 
+/// The map the rustdoc id tables are read into.
+///
+/// A document carries tens of thousands of short id keys, each hashed once on
+/// insert and again on every child, impl and re-export that refers to it.
+/// SipHash is the standard library's default because it keeps a map usable when
+/// an attacker chooses the keys; these keys are compiler-generated ids read out
+/// of a document that is already being trusted enough to parse, and foldhash
+/// still seeds itself randomly per process, so the trade here is a weaker
+/// collision-resistance guarantee that nothing was relying on.
+type FastMap<K, V> = HashMap<K, V, foldhash::fast::RandomState>;
+
 /// Whether docs.rs managed to build documentation for a release.
 #[derive(Clone, Debug, Deserialize)]
 #[non_exhaustive]
@@ -124,11 +135,11 @@ struct RustdocRoot {
     #[serde(default)]
     format_version: Option<u64>,
     #[serde(default)]
-    paths: HashMap<String, PathSummary>,
+    paths: FastMap<String, PathSummary>,
     #[serde(default)]
-    index: HashMap<String, IndexItem>,
+    index: FastMap<String, IndexItem>,
     #[serde(default)]
-    external_crates: HashMap<String, ExternalCrate>,
+    external_crates: FastMap<String, ExternalCrate>,
 }
 
 #[derive(Deserialize)]
@@ -483,6 +494,10 @@ impl DocIndex {
 /// table mentions merely because something references them. For `ratatui` that
 /// is the difference between 125 entries and 6805.
 fn collect_reexports(root: &RustdocRoot) -> Vec<Reexport> {
+    // The tables are keyed by the decimal form of an id, and `HashMap<String,
+    // _>` looks up by `&str`, so the digits are written into a stack buffer
+    // rather than a `String` that exists only long enough to be hashed.
+    let mut id = itoa::Buffer::new();
     root.index
         .values()
         .filter_map(|item| {
@@ -490,14 +505,14 @@ fn collect_reexports(root: &RustdocRoot) -> Vec<Reexport> {
             if kind != "use" {
                 return None;
             }
-            let target = root.paths.get(&body.target?.to_string())?;
+            let target = root.paths.get(id.format(body.target?))?;
             if target.crate_id == 0 || target.path.is_empty() {
                 return None;
             }
             // A crate this document does not name cannot be looked up, and the
             // whole value of a re-export entry is telling a caller where to go
             // next, so an unnamed one is dropped rather than described.
-            let defining_crate = root.external_crates.get(&target.crate_id.to_string())?;
+            let defining_crate = root.external_crates.get(id.format(target.crate_id))?;
             if defining_crate.name.is_empty() {
                 return None;
             }
@@ -558,13 +573,16 @@ fn collect_associated(
         return;
     };
 
+    // As in `collect_reexports`: one stack buffer for the decimal id, rather
+    // than a `String` allocated and dropped per impl block and per method.
+    let mut id = itoa::Buffer::new();
     let children: Vec<u32> = match kind {
         "trait" => body.items.clone(),
         "struct" | "enum" | "union" => body
             .impls
             .iter()
             .filter_map(|impl_id| {
-                let block = root.index.get(&impl_id.to_string())?;
+                let block = root.index.get(id.format(*impl_id))?;
                 let (_, impl_body) = block.classify()?;
                 (!impl_body.is_trait_impl).then(|| impl_body.items.clone())
             })
@@ -578,7 +596,7 @@ fn collect_associated(
             *truncated = true;
             return;
         }
-        let Some(child) = root.index.get(&child_id.to_string()) else {
+        let Some(child) = root.index.get(id.format(child_id)) else {
             continue;
         };
         let Some(name) = child.name.as_deref() else {
