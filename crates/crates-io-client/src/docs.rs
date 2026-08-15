@@ -248,7 +248,58 @@ pub struct DocIndex {
     items: Box<[ItemRow]>,
     /// Items re-exported from other crates, ordered by exposed name.
     reexports: Box<[ReexportRow]>,
+    /// Item positions ordered by final path segment, compared without regard to
+    /// case. Two of the four resolution steps are a lookup by that segment, and
+    /// against this they are a binary search over four bytes per item instead
+    /// of a scan of every path.
+    by_name: Box<[u32]>,
+    /// Re-export positions ordered by exposed name, the same way.
+    reexports_by_name: Box<[u32]>,
+    /// The three-byte sequences [`DocIndex::lowered`] contains.
+    ///
+    /// A substring can only occur if every one of its three-byte windows
+    /// occurs, so a query carrying one this set lacks matches nothing and is
+    /// answered without looking at an item. Membership errs in one direction
+    /// only: a sequence may be reported present when it is absent, which costs
+    /// a scan that finds nothing, and can never be reported absent when it is
+    /// present, so no match is ever missed.
+    trigrams: Box<[u64]>,
     truncated: bool,
+}
+
+/// Order two strings as if both had been ASCII-lowercased first.
+///
+/// The relation `eq_ignore_ascii_case` tests, extended to an ordering. Only
+/// re-exports use it: item names are compared through the lowercase arena
+/// instead, where an ordinary `str` comparison is already the right relation and
+/// is a `memcmp` rather than a byte-at-a-time loop.
+fn cmp_ignore_ascii_case(left: &str, right: &str) -> std::cmp::Ordering {
+    left.bytes()
+        .map(|byte| byte.to_ascii_lowercase())
+        .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
+}
+
+/// How many bits the trigram filter keeps.
+///
+/// 8 KiB per index. The paths of a whole crate draw on far fewer distinct
+/// three-byte sequences than that, so the set stays sparse and a query carrying
+/// an unseen one is rejected almost every time it deserves to be.
+const TRIGRAM_BITS: u32 = 16;
+
+/// Which slot a three-byte window falls in.
+fn trigram_slot(window: &[u8]) -> usize {
+    let key = u32::from(window[0]) << 16 | u32::from(window[1]) << 8 | u32::from(window[2]);
+    (key.wrapping_mul(0x9E37_79B1) >> (32 - TRIGRAM_BITS)) as usize
+}
+
+/// Record every three-byte sequence the lowercase arena contains.
+fn trigrams_of(lowered: &str) -> Box<[u64]> {
+    let mut set = vec![0_u64; 1 << (TRIGRAM_BITS - 6)];
+    for window in lowered.as_bytes().windows(3) {
+        let slot = trigram_slot(window);
+        set[slot / 64] |= 1 << (slot % 64);
+    }
+    set.into_boxed_slice()
 }
 
 /// Only the parts of the rustdoc JSON schema this crate reads.
@@ -534,10 +585,36 @@ impl DocIndex {
         // index that merely answers the same and one that *is* the same.
         let text = arenas.compact(&mut items, &mut reexports);
         let lowered = text.paths.to_ascii_lowercase();
+        let trigrams = trigrams_of(&lowered);
 
         if arenas.overflowed {
             return Err(decode("the document holds more text than an index can address"));
         }
+
+        // Built last, because a position only means something once the rows
+        // have stopped moving.
+        // Each name is located once, not once per comparison. Finding the last
+        // `::` means constructing a substring searcher, and a sort does n log n
+        // comparisons — for a document at the ceiling that is the difference
+        // between fifty thousand searches and eight hundred thousand.
+        let mut named: Vec<(Span, u32)> = (0..items.len() as u32)
+            .map(|position| {
+                let span = items[position as usize].path;
+                let offset = span.of(&lowered).rfind("::").map_or(0, |at| at + 2) as u32;
+                (Span { start: span.start + offset, len: span.len - offset }, position)
+            })
+            .collect();
+        // Read through the lowercase arena, where an ordinary comparison is
+        // already the case-insensitive one and runs as a `memcmp`.
+        named.sort_unstable_by(|left, right| {
+            left.0.of(&lowered).cmp(right.0.of(&lowered)).then(left.1.cmp(&right.1))
+        });
+        let by_name: Vec<u32> = named.into_iter().map(|(_, position)| position).collect();
+        let mut reexports_by_name: Vec<u32> = (0..reexports.len() as u32).collect();
+        reexports_by_name.sort_unstable_by(|&left, &right| {
+            let name = |position: u32| reexports[position as usize].name.of(&text.reexport_text);
+            cmp_ignore_ascii_case(name(left), name(right)).then(left.cmp(&right))
+        });
 
         Ok(Self {
             crate_version: root.crate_version,
@@ -549,6 +626,9 @@ impl DocIndex {
             reexport_text: text.reexport_text.into_boxed_str(),
             items: items.into_boxed_slice(),
             reexports: reexports.into_boxed_slice(),
+            by_name: by_name.into_boxed_slice(),
+            reexports_by_name: reexports_by_name.into_boxed_slice(),
+            trigrams,
             truncated,
         })
     }
@@ -632,6 +712,55 @@ impl DocIndex {
         self.items[position].path.of(&self.lowered)
     }
 
+    /// The final segment of an item's path, in lowercase.
+    fn lowered_name(&self, position: usize) -> &str {
+        let path = self.lowered_path(position);
+        path.rsplit("::").next().unwrap_or(path)
+    }
+
+    /// Whether any item path could contain this text.
+    ///
+    /// Consulted before the substring scan, and only ever able to rule the scan
+    /// out — never to claim a match.
+    fn could_contain(&self, lowered: &str) -> bool {
+        lowered.as_bytes().windows(3).all(|window| {
+            let slot = trigram_slot(window);
+            self.trigrams[slot / 64] & (1 << (slot % 64)) != 0
+        })
+    }
+
+    /// The stretch of an ordering whose entries carry `wanted` as their name.
+    ///
+    /// The ordering is sorted by the same case-insensitive comparison, so every
+    /// match is contiguous and two partition points bound it.
+    fn range_of<'a>(order: &'a [u32], wanted: &str, name: impl Fn(u32) -> &'a str) -> &'a [u32] {
+        let start = order
+            .partition_point(|&position| cmp_ignore_ascii_case(name(position), wanted).is_lt());
+        let len = order[start..]
+            .partition_point(|&position| cmp_ignore_ascii_case(name(position), wanted).is_eq());
+        &order[start..start + len]
+    }
+
+    /// Item positions whose final path segment matches, ignoring case.
+    ///
+    /// Takes the query already lowercased, because the ordering it searches is
+    /// over lowercase text.
+    fn positions_named(&self, lowered: &str) -> &[u32] {
+        let start = self
+            .by_name
+            .partition_point(|&position| self.lowered_name(position as usize) < lowered);
+        let len = self.by_name[start..]
+            .partition_point(|&position| self.lowered_name(position as usize) == lowered);
+        &self.by_name[start..start + len]
+    }
+
+    /// Re-export positions whose exposed name matches, ignoring case.
+    fn reexport_positions_named(&self, wanted: &str) -> &[u32] {
+        Self::range_of(&self.reexports_by_name, wanted, |position| {
+            self.reexports[position as usize].name.of(&self.reexport_text)
+        })
+    }
+
     /// Look an item up by path.
     ///
     /// Resolution widens in steps, so that a caller who knows the exact path
@@ -664,18 +793,31 @@ impl DocIndex {
             };
         }
 
+        // A path ending in `::query` ends in query's own final segment, so
+        // every candidate is already in the stretch of the ordering carrying
+        // that segment. What is left is the case-sensitive suffix test the
+        // ordering cannot express.
+        let wanted = query.rsplit("::").next().unwrap_or(query).to_ascii_lowercase();
         let suffix = format!("::{query}");
-        let by_suffix: Vec<DocItem<'_>> = (0..self.items.len())
-            .filter(|&position| self.item(position).path().ends_with(&suffix))
-            .map(|position| self.item(position))
+        let by_suffix: Vec<DocItem<'_>> = self
+            .positions_named(&wanted)
+            .iter()
+            .map(|&position| self.item(position as usize))
+            .filter(|item| item.path().ends_with(&suffix))
             .collect();
         if let Some(resolved) = resolve(&by_suffix) {
             return resolved;
         }
 
-        let by_name: Vec<DocItem<'_>> = (0..self.items.len())
-            .filter(|&position| self.item(position).short_name().eq_ignore_ascii_case(query))
-            .map(|position| self.item(position))
+        // The bare-name step is exactly what the ordering is keyed on, so the
+        // stretch is the answer: no filter, and nothing outside it to look at.
+        // A query carrying `::` cannot match a final segment, and finds an
+        // empty stretch rather than being special-cased.
+        let lowered = query.to_ascii_lowercase();
+        let by_name: Vec<DocItem<'_>> = self
+            .positions_named(&lowered)
+            .iter()
+            .map(|&position| self.item(position as usize))
             .collect();
         if let Some(resolved) = resolve(&by_name) {
             return resolved;
@@ -690,9 +832,13 @@ impl DocIndex {
             return Lookup { found: None, suggestions: Vec::new(), reexported };
         }
 
+        // Most misses stop here, without an item being looked at.
+        if !self.could_contain(&lowered) {
+            return Lookup::default();
+        }
+
         // The lowercase form of every path is already stored, so this compares
         // against it rather than building one per item per query.
-        let lowered = query.to_ascii_lowercase();
         let fuzzy: Vec<DocItem<'_>> = (0..self.items.len())
             .filter(|&position| self.lowered_path(position).contains(&lowered))
             .map(|position| self.item(position))
@@ -765,12 +911,14 @@ impl DocIndex {
     /// `Frame` and `ratatui::Frame` find the same item.
     fn reexported_as(&self, query: &str) -> Vec<Reexport<'_>> {
         let wanted = query.rsplit("::").next().unwrap_or(query);
-        let mut matches: Vec<Reexport<'_>> = (0..self.reexports.len())
-            .map(|position| self.reexport(position))
-            .filter(|item| item.name().eq_ignore_ascii_case(wanted))
-            .collect();
-        matches.truncate(MAX_SUGGESTIONS);
+        let matches = self.reexport_positions_named(wanted);
+        // Truncated in index order, not sorted first, which is what the linear
+        // scan did and what the equivalence suite pins.
         matches
+            .iter()
+            .take(MAX_SUGGESTIONS)
+            .map(|&position| self.reexport(position as usize))
+            .collect()
     }
 }
 
@@ -1686,6 +1834,36 @@ mod tests {
         // are both deterministic, so this number moving means one of them
         // changed, and a battery that quietly shrank would keep passing.
         assert_eq!(compared, 756, "the query battery changed size");
+    }
+
+    #[test]
+    fn the_trigram_filter_never_rejects_something_the_index_contains() {
+        // The filter is allowed to be wrong in one direction: reporting a
+        // sequence present when it is absent costs a scan that finds nothing.
+        // Reporting one absent when it is present would skip the scan and
+        // answer "no such item" about an item that exists, which is a wrong
+        // answer rather than a slow one. Every substring of a path is a query
+        // that must survive it.
+        let mut checked = 0_usize;
+        for (label, index) in equivalence_corpus() {
+            for position in (0..index.len()).step_by(97) {
+                let path = index.lowered_path(position);
+                for start in 0..path.len() {
+                    for end in start + 1..=path.len() {
+                        if !path.is_char_boundary(start) || !path.is_char_boundary(end) {
+                            continue;
+                        }
+                        let candidate = &path[start..end];
+                        assert!(
+                            index.could_contain(candidate),
+                            "{label}: {candidate:?} occurs in {path:?} but was ruled out"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000, "only {checked} substrings were checked");
     }
 
     #[test]
