@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use crates_io_client::{
-    Client, CrateIndex, DependencyKind, Error, Include, IndexEntry, SearchParams, Selector,
+    Category, Client, CrateIndex, DependencyKind, Error, Include, IndexEntry, SearchParams,
+    Selector,
 };
 use rmcp::{
     ErrorData, ServerHandler,
@@ -157,7 +158,7 @@ impl CratesServer {
             name: summary.name.clone(),
             description: summary.description.clone(),
             latest_stable_version: latest.map(|entry| entry.vers.clone()),
-            newest_version: index.descending().next().map(|entry| entry.vers.clone()),
+            newest_version: newest_live_version(&index),
             default_version: summary.default_version.clone(),
             total_versions: index.len(),
             downloads: summary.downloads,
@@ -235,7 +236,7 @@ impl CratesServer {
                 .resolve(&Selector::Default, false)
                 .ok()
                 .map(|entry| entry.vers.clone()),
-            newest_version: index.descending().next().map(|entry| entry.vers.clone()),
+            newest_version: newest_live_version(&index),
             truncated,
             versions,
         }))
@@ -244,7 +245,8 @@ impl CratesServer {
     /// Report one version's dependencies.
     #[tool(description = "List what one version of a crate depends on, with each dependency's \
                           version requirement, enabled features, target platform and whether it \
-                          is optional. Defaults to runtime dependencies of the newest stable \
+                          is optional, plus the crate's own feature table showing what each \
+                          feature enables. Defaults to runtime dependencies of the newest stable \
                           release.")]
     async fn get_crate_dependencies(
         &self,
@@ -272,6 +274,12 @@ impl CratesServer {
             name: index.name().to_owned(),
             version: entry.vers.clone(),
             yanked: entry.yanked,
+            // Already in memory from the index document this call fetched.
+            features: entry
+                .all_features()
+                .into_iter()
+                .map(|(feature, enables)| ((*feature).to_owned(), enables.to_vec()))
+                .collect(),
             normal: collect(DepKind::Normal),
             dev: collect(DepKind::Dev),
             build: collect(DepKind::Build),
@@ -288,6 +296,13 @@ impl CratesServer {
         Parameters(args): Parameters<GetCrateDocumentationArgs>,
     ) -> Result<Json<CrateDocumentationResult>, ErrorData> {
         let selector = Self::selector(args.version.as_deref())?;
+        if args.max_readme_chars == Some(0) {
+            // A zero budget yields nothing but the truncation marker, which is
+            // never what a caller meant; `include_readme: false` says it.
+            return Err(invalid_argument(
+                "max_readme_chars must be at least 1; use include_readme: false to omit the                  README entirely",
+            ));
+        }
         let max_chars = args
             .max_readme_chars
             .map_or(crates_io_client::DEFAULT_README_CHARS, |chars| chars as usize);
@@ -342,11 +357,29 @@ impl CratesServer {
         let docs_rs_built = match docs_result {
             Docs::Status(Ok(status)) => Some(status.doc_status),
             Docs::Status(Err(err)) => {
-                notes.push(format!("docs.rs has no build for this release: {err}"));
-                Some(false)
+                // Only a genuine "no such release" answer says anything about
+                // the build. A timeout or a 5xx says nothing, and reporting it
+                // as a failed build would assert a fact this call did not
+                // establish.
+                if err.category() == Category::NotFound {
+                    notes.push(format!("docs.rs has no build for this release: {err}"));
+                    Some(false)
+                } else {
+                    notes.push(format!("the docs.rs build status could not be read: {err}"));
+                    None
+                }
             },
             Docs::Index(Ok(doc_index)) => {
                 documented_items = Some(doc_index.len());
+                if doc_index.is_truncated() {
+                    // Without this, an item that was indexed away reads as an
+                    // item that does not exist.
+                    notes.push(format!(
+                        "this release has more documented items than are indexed, so a miss here \
+                         does not prove the item is absent; {} were indexed",
+                        doc_index.len()
+                    ));
+                }
                 let query = args.item.as_deref().unwrap_or_default();
                 let lookup = doc_index.lookup(query);
                 item = lookup.found.map(ItemDoc::from);
@@ -399,6 +432,15 @@ impl CratesServer {
             note: (!notes.is_empty()).then(|| notes.join("; ")),
         }))
     }
+}
+
+/// The highest version of any kind that has not been yanked.
+///
+/// Pre-releases count, since "newest" means newest; a yanked release does not,
+/// because reporting a withdrawn version as the newest one would send a caller
+/// to something they cannot use, and the field carries no yank flag of its own.
+fn newest_live_version(index: &CrateIndex) -> Option<String> {
+    index.descending().find(|entry| !entry.yanked).map(|entry| entry.vers.clone())
 }
 
 /// Which documentation request was made, so both arms can share one join.

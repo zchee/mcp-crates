@@ -42,7 +42,7 @@ impl Server {
         let mut server = Self { child, stdin, stdout, next_id: 1 };
 
         let initialized = server
-            .request(
+            .call(
                 "initialize",
                 json!({
                     "protocolVersion": "2025-11-25",
@@ -89,11 +89,6 @@ impl Server {
         Ok(message["result"].take())
     }
 
-    /// Send a request that is expected to succeed.
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value, Value> {
-        self.call(method, params).await
-    }
-
     /// Send a notification, which has no reply.
     async fn notify(&mut self, method: &str) {
         let line = serde_json::to_string(&json!({"jsonrpc": "2.0", "method": method}))
@@ -123,7 +118,7 @@ impl Server {
 async fn the_server_advertises_exactly_the_documented_tools() {
     let mut server = Server::start().await;
 
-    let result = server.request("tools/list", json!({})).await.expect("tools/list succeeds");
+    let result = server.call("tools/list", json!({})).await.expect("tools/list succeeds");
     let mut names: Vec<&str> = result["tools"]
         .as_array()
         .expect("tools is an array")
@@ -150,7 +145,7 @@ async fn the_server_advertises_exactly_the_documented_tools() {
 async fn every_tool_documents_its_arguments() {
     let mut server = Server::start().await;
 
-    let result = server.request("tools/list", json!({})).await.expect("tools/list succeeds");
+    let result = server.call("tools/list", json!({})).await.expect("tools/list succeeds");
     for tool in result["tools"].as_array().expect("tools is an array") {
         let name = tool["name"].as_str().expect("each tool is named");
 
@@ -181,7 +176,7 @@ async fn every_tool_documents_its_arguments() {
 async fn the_crate_name_is_required_by_the_schema_of_every_lookup_tool() {
     let mut server = Server::start().await;
 
-    let result = server.request("tools/list", json!({})).await.expect("tools/list succeeds");
+    let result = server.call("tools/list", json!({})).await.expect("tools/list succeeds");
     for tool in result["tools"].as_array().expect("tools is an array") {
         let name = tool["name"].as_str().expect("each tool is named");
         if name == "search_crates" {
@@ -249,6 +244,19 @@ async fn out_of_range_pagination_is_rejected() {
             .expect_err("out of range pagination is rejected");
         assert_eq!(error["code"], -32602, "{arguments}: {error}");
     }
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_zero_readme_budget_is_rejected_rather_than_returning_a_marker() {
+    let mut server = Server::start().await;
+
+    let error = server
+        .call_tool("get_crate_documentation", json!({"name": "serde", "max_readme_chars": 0}))
+        .await
+        .expect_err("a zero budget is rejected");
+    assert_eq!(error["code"], -32602, "{error}");
 
     server.shutdown().await;
 }

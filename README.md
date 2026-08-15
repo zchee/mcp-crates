@@ -119,6 +119,9 @@ channel. Slots are handed out in arrival order, so nothing starves, and a caller
 that would have to wait past a configured ceiling is told so immediately rather
 than stalling a tool call indefinitely.
 
+The pacer lives in the process, so the budget is per server. Running several
+copies at once spends several times the rate; run one and let its cache work.
+
 ## Item-level documentation
 
 `get_crate_documentation` reads the rustdoc JSON that docs.rs generates for each

@@ -237,7 +237,8 @@ pub struct CrateInfoResult {
     /// what `cargo add` would pick.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_stable_version: Option<String>,
-    /// The highest version of any kind, pre-releases included.
+    /// The highest version of any kind, pre-releases included and yanked
+    /// releases excluded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub newest_version: Option<String>,
     /// The version crates.io presents by default.
@@ -352,7 +353,8 @@ pub struct CrateVersionsResult {
     /// The newest version that is neither yanked nor a pre-release.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_stable_version: Option<String>,
-    /// The highest version of any kind, pre-releases included.
+    /// The highest version of any kind, pre-releases included and yanked
+    /// releases excluded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub newest_version: Option<String>,
     /// Whether the returned list was cut short by `limit`.
@@ -464,7 +466,17 @@ pub struct CrateDependenciesResult {
     pub version: String,
     /// Whether that version has been yanked.
     pub yanked: bool,
-    /// Dependencies linked into the crate itself.
+    /// The release's Cargo features, each mapped to what enabling it turns on.
+    ///
+    /// Reported alongside the dependencies because the two are the same
+    /// question: an optional dependency is only pulled in by whichever feature
+    /// enables it, and this says which. Entries of the form `dep:name` name an
+    /// optional dependency directly.
+    pub features: std::collections::BTreeMap<String, Vec<String>>,
+    /// Dependencies linked into the crate itself. Omitted when `normal` was not
+    /// among the requested kinds, so an empty list always means no such
+    /// dependencies rather than a kind that was not asked for.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub normal: Vec<DependencyEntry>,
     /// Dependencies of tests, examples and benchmarks.
     #[serde(skip_serializing_if = "Vec::is_empty")]
