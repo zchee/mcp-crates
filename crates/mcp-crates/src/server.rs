@@ -364,8 +364,17 @@ impl CratesServer {
                 Some(true)
             },
             Docs::Index(Err(err)) => {
-                notes.push(format!("item documentation is unavailable: {err}"));
-                Some(false)
+                // Absent rustdoc JSON does not mean docs.rs failed to build the
+                // release: it only publishes the JSON for builds recent enough
+                // to have produced it, so older releases have rendered HTML
+                // documentation and no JSON. Reporting `false` here would
+                // contradict what the status endpoint says about the same
+                // release, so the field is left unknown instead.
+                notes.push(format!(
+                    "item documentation could not be read for this release ({err}); its rendered \
+                     documentation may still exist at {docs_rs_url}"
+                ));
+                None
             },
         };
 

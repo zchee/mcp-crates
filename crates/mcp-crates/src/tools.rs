@@ -132,6 +132,10 @@ pub struct CrateHit {
 }
 
 impl From<&CrateSummary> for CrateHit {
+    /// Unlike the crate detail endpoint, search computes its version fields
+    /// correctly without being asked for the per-version payload, so they are
+    /// used directly here. `get_crate_info` takes them from the sparse index
+    /// instead, and the two are not interchangeable.
     fn from(summary: &CrateSummary) -> Self {
         Self {
             name: summary.name.clone(),
@@ -542,8 +546,11 @@ pub struct CrateDocumentationResult {
     /// `get_crate_info`; repeating it here would cost an extra API request for
     /// a link the caller can already get.
     pub docs_rs_url: String,
-    /// Whether docs.rs built documentation for this release. Absent when not
-    /// checked, which is the case whenever an item lookup was requested.
+    /// Whether docs.rs built documentation for this release.
+    ///
+    /// Absent when it could not be determined: an item lookup reads the
+    /// rustdoc JSON, which docs.rs publishes only for recent enough builds, so
+    /// its absence does not by itself mean the build failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docs_rs_built: Option<bool>,
     /// The crate's README, converted to Markdown.
