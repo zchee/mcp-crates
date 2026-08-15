@@ -27,6 +27,9 @@ zstd.workspace = true
 [dev-dependencies]
 divan.workspace = true
 http.workspace = true
+# The library stays allocator-agnostic; the benchmark installs the same
+# allocator the server binary runs, so a checkpoint measures what ships.
+mimalloc.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 
 # divan supplies its own `main`, so the libtest harness is not linked in.

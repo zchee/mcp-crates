@@ -18,6 +18,14 @@ use std::{fmt::Write as _, sync::LazyLock};
 
 use crates_io_client::{CrateIndex, DocIndex, Lookup, docs, readme};
 
+/// The allocator the server binary installs.
+///
+/// The library itself is allocator-agnostic, so nothing would otherwise pull
+/// this in — and a benchmark measuring the system allocator would be measuring
+/// something no user runs. Most of what is timed below is allocation.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Expansion ceiling handed to `decompress_rustdoc`, far above any fixture.
 const DECOMPRESS_LIMIT: usize = 64 * 1024 * 1024;
 

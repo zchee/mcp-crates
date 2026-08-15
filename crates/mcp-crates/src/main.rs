@@ -8,6 +8,13 @@ use mcp_crates::CratesServer;
 use rmcp::{ServiceExt, transport::stdio};
 use tracing_subscriber::EnvFilter;
 
+/// Indexing a rustdoc document is hundreds of thousands of short-lived
+/// allocations arriving in a burst on one blocking thread, which is the shape
+/// the system allocator's per-size-class locking handles worst. mimalloc serves
+/// that burst from thread-local free lists instead.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// The crates.io crawler policy: no more than one API request per second.
 ///
 /// Configurable upwards but never downwards; a client that ignores this risks

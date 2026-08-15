@@ -18,6 +18,7 @@ path = "src/main.rs"
 crates-io-client.workspace = true
 
 clap.workspace = true
+mimalloc.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 semver.workspace = true
