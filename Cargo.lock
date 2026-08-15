@@ -364,6 +364,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "htmd",
+ "http",
  "moka",
  "reqwest",
  "semver",

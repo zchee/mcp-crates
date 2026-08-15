@@ -637,6 +637,95 @@ mod tests {
         map
     }
 
+    fn fetcher_with_body_limit(limit: usize) -> Fetcher {
+        let mut config = Config::new("test/1.0 (+https://example.invalid)");
+        config.max_body_bytes = limit;
+        Fetcher::new(&config).expect("the fetcher builds")
+    }
+
+    fn response_of(len: usize) -> reqwest::Response {
+        reqwest::Response::from(
+            http::Response::builder().status(200).body(vec![b'x'; len]).expect("a valid response"),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_body_within_the_ceiling_is_read_whole() {
+        let fetcher = fetcher_with_body_limit(1024);
+        let url = Url::parse("https://crates.io/x").expect("valid url");
+
+        let body = fetcher.read_body(response_of(1024), &url).await.expect("it fits exactly");
+        assert_eq!(body.len(), 1024, "a body at the ceiling is not over it");
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_ceiling_is_refused() {
+        let fetcher = fetcher_with_body_limit(1024);
+        let url = Url::parse("https://crates.io/x").expect("valid url");
+
+        let refused = fetcher.read_body(response_of(1025), &url).await;
+        assert!(matches!(refused, Err(Error::BodyTooLarge { limit: 1024, .. })), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn a_body_larger_than_it_claims_to_be_is_still_refused() {
+        // The declared length is only a first check. A response that understates
+        // its size, or omits the length because the transfer is compressed, has
+        // to be stopped as the bytes arrive instead.
+        let fetcher = fetcher_with_body_limit(1024);
+        let url = Url::parse("https://crates.io/x").expect("valid url");
+
+        let understated = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header(reqwest::header::CONTENT_LENGTH, "8")
+                .body(vec![b'x'; 4096])
+                .expect("a valid response"),
+        );
+
+        let refused = fetcher.read_body(understated, &url).await;
+        assert!(matches!(refused, Err(Error::BodyTooLarge { limit: 1024, .. })), "{refused:?}");
+    }
+
+    #[test]
+    fn backoff_grows_with_each_attempt_and_stays_bounded() {
+        // Building a fetcher makes no requests, so this needs no network.
+        let fetcher = Fetcher::new(&Config::new("test/1.0 (+https://example.invalid)"))
+            .expect("the fetcher builds");
+
+        // Base delay is 200ms doubled per attempt and capped at the fifth, with
+        // up to half the base added as jitter.
+        for (attempt, base_ms) in [(1_u32, 400_u64), (2, 800), (3, 1600), (4, 3200)] {
+            let delay = fetcher.backoff(attempt).as_millis() as u64;
+            assert!(
+                (base_ms..=base_ms + base_ms / 2).contains(&delay),
+                "attempt {attempt} produced {delay}ms, outside {base_ms}..={}",
+                base_ms + base_ms / 2
+            );
+        }
+
+        // The shift is clamped, so a runaway attempt count cannot overflow it.
+        let capped = fetcher.backoff(64).as_millis() as u64;
+        assert!((3200..=4800).contains(&capped), "an extreme attempt gave {capped}ms");
+    }
+
+    #[test]
+    fn concurrent_retries_do_not_all_wait_the_same_amount() {
+        // Identical delays would re-collide the requests that just failed
+        // together, which is the whole point of the jitter.
+        let fetcher = Fetcher::new(&Config::new("test/1.0 (+https://example.invalid)"))
+            .expect("the fetcher builds");
+
+        let delays: std::collections::HashSet<u128> =
+            (0..16).map(|_| fetcher.backoff(2).as_millis()).collect();
+        assert!(delays.len() > 1, "every retry waited exactly {delays:?}");
+    }
+
+    #[test]
+    fn an_empty_user_agent_is_refused_because_crates_io_requires_one() {
+        assert!(matches!(Fetcher::new(&Config::new("  ")), Err(Error::InvalidArgument(_))));
+    }
+
     #[test]
     fn only_crates_io_and_docs_rs_origins_are_reachable() {
         let cases = [
