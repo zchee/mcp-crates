@@ -133,6 +133,13 @@ pub enum Error {
         ceiling_ms: u64,
     },
 
+    /// The client reached a state it does not know how to continue from.
+    ///
+    /// Never the caller's doing, and classified accordingly so that it is not
+    /// reported back as a bad argument.
+    #[error("the client cannot continue: {0}")]
+    Internal(String),
+
     /// A URL was malformed, or a redirect left the set of permitted hosts.
     #[error("refusing to request {url}: {reason}")]
     UnsupportedUrl {
@@ -182,6 +189,7 @@ impl Error {
             Self::Network { .. } => "network_error",
             Self::Decode { .. } => "decode_error",
             Self::BodyTooLarge { .. } => "body_too_large",
+            Self::Internal(_) => "internal_error",
             Self::RateLimitQueueFull { .. } => "rate_limited",
             Self::UnsupportedUrl { .. } => "unsupported_url",
         }
@@ -244,6 +252,14 @@ mod tests {
         };
         assert!(shed.retryable(), "the caller may retry after a pause");
         assert!(!shed.is_transient(), "an immediate in-process retry would be shed again");
+    }
+
+    #[test]
+    fn an_internal_failure_is_not_blamed_on_the_caller() {
+        let err = Error::Internal("the parser has been shut down".to_owned());
+
+        assert_eq!(err.category(), Category::Upstream, "the caller supplied nothing wrong");
+        assert_eq!(err.kind(), "internal_error");
     }
 
     #[test]

@@ -551,6 +551,18 @@ fn if_none_match(etag: &str) -> &str {
     etag.strip_prefix("W/").unwrap_or(etag)
 }
 
+/// Whether a character carries no visible content and so cannot be the start of
+/// a message.
+///
+/// Covers the zero-width format characters as well as whitespace, because a
+/// document is free to open with a byte-order mark and the check that follows
+/// this one has to see the first character that actually renders.
+fn is_invisible(character: char) -> bool {
+    character.is_whitespace()
+        || character.is_control()
+        || matches!(character, '\u{feff}' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}')
+}
+
 /// Whether a status means "this resource is not there", and so is worth
 /// remembering briefly.
 ///
@@ -652,7 +664,10 @@ fn extract_detail(body: &[u8]) -> Option<String> {
         }
     }
     let text = String::from_utf8_lossy(body);
-    let trimmed = text.trim();
+    // Not `trim`: it removes only characters with the White_Space property, and
+    // a byte-order mark or a zero-width space is category Cf, so a document
+    // opening with one would keep its markup out of reach of the check below.
+    let trimmed = text.trim_matches(is_invisible);
     // Dropping markup is what keeps this detail free of anything a crate author
     // wrote, and consumers rely on that: the detail is reported to a caller
     // unframed, on the grounds that only the registry itself composes these
@@ -957,6 +972,22 @@ mod tests {
         assert_eq!(extract_detail(docs_error), None);
 
         assert_eq!(extract_detail(b"   \n  <html>"), None, "leading whitespace does not evade it");
+
+        // A byte-order mark and a zero-width space are category Cf, which
+        // `str::trim` leaves in place. Without accounting for them the guard
+        // would see the mark rather than the `<` and pass the markup through.
+        assert_eq!(extract_detail("\u{feff}<html>fail</html>".as_bytes()), None, "BOM prefix");
+        assert_eq!(extract_detail("\u{200b}<html>fail</html>".as_bytes()), None, "ZWSP prefix");
+        assert_eq!(extract_detail("\u{2060}\u{feff} <Error/>".as_bytes()), None, "mixed prefix");
+    }
+
+    #[test]
+    fn invisible_prefixes_do_not_swallow_a_real_message() {
+        assert_eq!(
+            extract_detail("\u{feff}rate limited".as_bytes()),
+            Some("rate limited".to_owned()),
+            "trimming the mark must not discard the message behind it"
+        );
     }
 
     #[test]

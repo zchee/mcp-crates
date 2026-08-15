@@ -312,7 +312,7 @@ impl Client {
         // it is CPU-bound, so it is admitted a couple at a time and run off the
         // async runtime rather than occupying a reactor thread.
         let _permit = self.doc_parses.acquire().await.map_err(|_| {
-            Error::InvalidArgument("the documentation parser has been shut down".to_owned())
+            Error::Internal("the documentation parser has been shut down".to_owned())
         })?;
 
         let limit = self.max_rustdoc_bytes;

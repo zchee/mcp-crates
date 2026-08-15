@@ -41,9 +41,8 @@ pub fn to_markdown(html: &str) -> String {
         .build();
 
     let markdown = converter.convert(html).unwrap_or_else(|_| strip_tags(html));
-    let without_empty_links = remove_empty_links(&markdown);
-    let inert = neutralize_unsafe_links(&without_empty_links);
-    collapse_blank_lines(inert.trim())
+    let rewritten = rewrite_links(&markdown);
+    collapse_blank_lines(rewritten.trim())
 }
 
 /// Schemes a link destination may use and still be presented as a link.
@@ -87,16 +86,33 @@ fn is_safe_destination(destination: &str) -> bool {
     SAFE_SCHEMES.iter().any(|safe| scheme.eq_ignore_ascii_case(safe))
 }
 
-/// Demote links whose destination uses an unexpected scheme to plain text.
+/// Rewrite a document's links: drop the ones carrying nothing, demote the ones
+/// pointing somewhere unexpected.
 ///
-/// crates.io sanitizes the HTML it renders, so this is a second line rather
-/// than the only one. It costs a scan and removes the question of whether a
-/// `javascript:` destination could reach a consumer that renders what it is
-/// given.
-fn neutralize_unsafe_links(markdown: &str) -> String {
+/// Both jobs run in one pass because both need the same two things: agreement
+/// on where a destination ends, and the same exemption for fenced code. A
+/// bracket-paren sequence inside a fence is a crate's own example, and editing
+/// it would be editing their documentation.
+///
+/// A link with empty text comes from the anchor crates.io injects into every
+/// heading, or from a badge image that has just been removed; neither leaves
+/// anything a reader can use. A link whose destination uses an unexpected
+/// scheme keeps its text and loses where it pointed — crates.io sanitizes the
+/// HTML it renders, so that half is a second line rather than the only one.
+fn rewrite_links(markdown: &str) -> String {
     let mut output = String::with_capacity(markdown.len());
+    let mut in_fence = false;
 
     for line in markdown.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        }
+        if in_fence {
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        }
+
         let mut rest = line;
         while let Some(open) = rest.find('[') {
             let Some(separator) = rest[open..].find("](").map(|offset| open + offset) else {
@@ -106,12 +122,15 @@ fn neutralize_unsafe_links(markdown: &str) -> String {
                 break;
             };
 
+            let text = &rest[open + 1..separator];
             output.push_str(&rest[..open]);
-            if is_safe_destination(&rest[separator + 2..close]) {
+            if text.is_empty() {
+                // Nothing worth keeping on either side of it.
+            } else if is_safe_destination(&rest[separator + 2..close]) {
                 output.push_str(&rest[open..=close]);
             } else {
                 // Keep what the reader was meant to see, drop where it pointed.
-                output.push_str(&rest[open + 1..separator]);
+                output.push_str(text);
             }
             rest = &rest[close + 1..];
         }
@@ -156,44 +175,6 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
     let mut output = String::with_capacity(head.len() + TRUNCATION_MARKER.len());
     output.push_str(head);
     output.push_str(TRUNCATION_MARKER);
-    output
-}
-
-/// Drop links whose text is empty.
-///
-/// These come from two places: the anchor links crates.io injects into every
-/// heading, and badge images that have just been removed. Neither leaves
-/// anything a reader can use.
-///
-/// Fenced code blocks are left alone, since bracket-paren sequences inside them
-/// are code rather than markup.
-fn remove_empty_links(markdown: &str) -> String {
-    let mut output = String::with_capacity(markdown.len());
-    let mut in_fence = false;
-
-    for line in markdown.lines() {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-        }
-        if in_fence {
-            output.push_str(line);
-            output.push('\n');
-            continue;
-        }
-
-        let mut rest = line;
-        while let Some(start) = rest.find("[](") {
-            let Some(end) = destination_end(rest, start + 3) else {
-                break;
-            };
-            output.push_str(&rest[..start]);
-            rest = &rest[end + 1..];
-        }
-        output.push_str(rest);
-        output.push('\n');
-    }
-
-    output.truncate(output.trim_end().len());
     output
 }
 
@@ -330,23 +311,32 @@ mod tests {
 
     #[test]
     fn empty_links_are_removed_but_real_ones_are_kept() {
-        assert_eq!(remove_empty_links("see [](#anchor)the docs"), "see the docs");
-        assert_eq!(remove_empty_links("see [the docs](https://x)"), "see [the docs](https://x)");
-        assert_eq!(remove_empty_links("a [](#one) b [](#two) c"), "a  b  c");
+        assert_eq!(rewrite_links("see [](#anchor)the docs"), "see the docs");
+        assert_eq!(rewrite_links("see [the docs](https://x)"), "see [the docs](https://x)");
+        assert_eq!(rewrite_links("a [](#one) b [](#two) c"), "a  b  c");
     }
 
     #[test]
-    fn bracket_sequences_inside_code_fences_are_left_alone() {
+    fn links_inside_code_fences_are_left_alone() {
         let source = "text\n```rust\nlet v: Vec<u8> = [](); // odd but code\n```\nmore";
-        assert_eq!(remove_empty_links(source), source);
+        assert_eq!(rewrite_links(source), source);
+    }
+
+    #[test]
+    fn an_unsafe_link_inside_a_code_fence_is_left_alone() {
+        // A crate documenting how to handle a `data:` URL should get its own
+        // example back unedited. The fence exemption has to cover both halves
+        // of the pass, which is why they are one pass.
+        let source = "before\n```md\nsee [label](data:text/html,x)\n```\nafter";
+        assert_eq!(rewrite_links(source), source);
     }
 
     #[test]
     fn a_destination_containing_parentheses_is_consumed_whole() {
         // Both link passes have to agree on where a destination ends, or one
         // leaves the tail of it behind as visible text.
-        assert_eq!(remove_empty_links("a [](https://x.example/a(b)c) b"), "a  b");
-        assert_eq!(neutralize_unsafe_links("[t](javascript:f(1)) tail"), "t tail");
+        assert_eq!(rewrite_links("a [](https://x.example/a(b)c) b"), "a  b");
+        assert_eq!(rewrite_links("[t](javascript:f(1)) tail"), "t tail");
         assert_eq!(destination_end("(a(b)c) rest", 1), Some(6));
         assert_eq!(destination_end("unterminated", 0), None);
     }
@@ -366,12 +356,9 @@ mod tests {
 
     #[test]
     fn an_unsafe_link_keeps_its_text_and_loses_its_destination() {
+        assert_eq!(rewrite_links("see [the docs](javascript:alert(1)) now"), "see the docs now");
         assert_eq!(
-            neutralize_unsafe_links("see [the docs](javascript:alert(1)) now"),
-            "see the docs now"
-        );
-        assert_eq!(
-            neutralize_unsafe_links("see [the docs](https://x.example)"),
+            rewrite_links("see [the docs](https://x.example)"),
             "see [the docs](https://x.example)"
         );
     }
@@ -379,7 +366,7 @@ mod tests {
     #[test]
     fn a_line_with_several_links_neutralizes_only_the_unsafe_ones() {
         let line = "[a](https://x.example) and [b](data:text/html,x) and [c](#anchor)";
-        assert_eq!(neutralize_unsafe_links(line), "[a](https://x.example) and b and [c](#anchor)");
+        assert_eq!(rewrite_links(line), "[a](https://x.example) and b and [c](#anchor)");
     }
 
     #[test]
