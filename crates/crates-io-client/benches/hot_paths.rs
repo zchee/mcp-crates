@@ -86,7 +86,7 @@ fn verify_fixtures() {
     assert_eq!(REGEX.parse().format_version(), Some(55), "the older fixture is format_version 55");
     assert_eq!(SEMVER.parse().format_version(), Some(60), "the newer fixture is format_version 60");
 
-    let found = |lookup: Lookup<'_>| lookup.found.map(|item| item.path.to_string());
+    let found = |lookup: Lookup<'_>| lookup.found.map(|item| item.path().to_owned());
     assert_eq!(
         found(REGEX_INDEX.lookup("regex::builders::bytes::RegexBuilder::build")).as_deref(),
         Some("regex::builders::bytes::RegexBuilder::build")

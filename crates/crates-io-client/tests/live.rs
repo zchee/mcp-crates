@@ -200,8 +200,8 @@ async fn item_documentation_is_read_from_rustdoc_json(client: &Client) {
         .lookup("Deserializer::deserialize_any")
         .found
         .expect("a trait method resolves from its type and name alone");
-    assert_eq!(method.path.as_ref(), "serde::de::Deserializer::deserialize_any");
-    assert!(method.docs.is_some(), "the method is documented upstream");
+    assert_eq!(method.path(), "serde::de::Deserializer::deserialize_any");
+    assert!(method.docs().is_some(), "the method is documented upstream");
 }
 
 async fn repeated_questions_cost_nothing(client: &Client) {

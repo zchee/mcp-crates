@@ -542,18 +542,15 @@ pub struct ItemDoc {
     pub deprecated: bool,
 }
 
-impl From<&DocItem> for ItemDoc {
+impl From<DocItem<'_>> for ItemDoc {
     /// The documentation is a doc comment written by whoever published the
     /// crate, so it is framed rather than passed through bare.
-    fn from(item: &DocItem) -> Self {
+    fn from(item: DocItem<'_>) -> Self {
         Self {
-            path: item.path.to_string(),
-            kind: item.kind.to_string(),
-            documentation: item
-                .docs
-                .as_ref()
-                .map(|docs| crate::untrusted::frame("documentation", docs)),
-            deprecated: item.deprecated,
+            path: item.path().to_owned(),
+            kind: item.kind().to_owned(),
+            documentation: item.docs().map(|docs| crate::untrusted::frame("documentation", docs)),
+            deprecated: item.deprecated(),
         }
     }
 }
@@ -573,13 +570,13 @@ pub struct ReexportedItem {
     pub kind: String,
 }
 
-impl From<&Reexport> for ReexportedItem {
-    fn from(reexport: &Reexport) -> Self {
+impl From<Reexport<'_>> for ReexportedItem {
+    fn from(reexport: Reexport<'_>) -> Self {
         Self {
-            name: reexport.name.to_string(),
-            defined_in: reexport.defining_crate.to_string(),
-            path: reexport.path.to_string(),
-            kind: reexport.kind.to_string(),
+            name: reexport.name().to_owned(),
+            defined_in: reexport.defining_crate().to_owned(),
+            path: reexport.path().to_owned(),
+            kind: reexport.kind().to_owned(),
         }
     }
 }

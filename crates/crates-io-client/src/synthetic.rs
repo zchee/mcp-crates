@@ -121,7 +121,7 @@ mod tests {
         // iteration order. Uniqueness here is what keeps the parity suite
         // comparing parsers rather than comparing hash seeds.
         let index = DocIndex::parse("synth", rustdoc_document(2_048).as_bytes()).expect("parses");
-        let paths: Vec<&str> = index.items().iter().map(|item| item.path.as_ref()).collect();
+        let paths: Vec<&str> = index.items().map(|item| item.path()).collect();
 
         let mut sorted = paths.clone();
         sorted.sort_unstable();

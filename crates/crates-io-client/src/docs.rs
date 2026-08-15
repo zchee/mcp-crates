@@ -55,28 +55,111 @@ pub struct BuildStatus {
     pub version: Option<String>,
 }
 
-/// One documented item from a crate's rustdoc JSON.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct DocItem {
-    /// The item's full path, such as `serde::de::Deserializer::deserialize_any`.
-    pub path: Box<str>,
-    /// The rustdoc item kind: `struct`, `trait`, `function`, `module`,
-    /// `assoc_type`, and so on.
-    pub kind: Box<str>,
-    /// The item's documentation comment, if it has one.
-    pub docs: Option<Box<str>>,
-    /// Whether the item is marked deprecated.
-    pub deprecated: bool,
+/// A slice of one of an index's text arenas.
+///
+/// Every path, doc comment, kind name and re-export string lives inside a
+/// handful of contiguous buffers rather than in an allocation of its own. A
+/// crate at the item ceiling used to mean a few hundred thousand small
+/// `Box<str>`s; it now means five buffers and a flat array of records.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Span {
+    start: u32,
+    len: u32,
 }
 
-impl DocItem {
-    /// The final segment of the item's path.
-    #[must_use]
-    pub fn short_name(&self) -> &str {
-        self.path.rsplit("::").next().unwrap_or(&self.path)
+impl Span {
+    /// The text this span names.
+    ///
+    /// Sound for any span this module produced: each is recorded from an
+    /// arena's length immediately before appending, so both ends land on a
+    /// character boundary.
+    fn of(self, arena: &str) -> &str {
+        &arena[self.start as usize..self.start as usize + self.len as usize]
+    }
+
+    /// Whether the span names nothing.
+    ///
+    /// Documentation is trimmed and empty documentation is dropped, so a
+    /// zero-length doc span means "undocumented" without an `Option` around it.
+    const fn is_empty(self) -> bool {
+        self.len == 0
     }
 }
+
+/// One item, as stored: four spans and a flag, with no text of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ItemRow {
+    path: Span,
+    kind: Span,
+    docs: Span,
+    deprecated: bool,
+}
+
+/// One re-export, as stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReexportRow {
+    name: Span,
+    defining_crate: Span,
+    path: Span,
+    kind: Span,
+}
+
+/// One documented item from a crate's rustdoc JSON.
+///
+/// A borrowed view: the item's text lives in the index that produced it, so
+/// this is a pair of pointers and copying it is free.
+#[derive(Clone, Copy, Debug)]
+pub struct DocItem<'a> {
+    index: &'a DocIndex,
+    row: &'a ItemRow,
+}
+
+impl<'a> DocItem<'a> {
+    /// The item's full path, such as `serde::de::Deserializer::deserialize_any`.
+    #[must_use]
+    pub fn path(self) -> &'a str {
+        self.row.path.of(&self.index.paths)
+    }
+
+    /// The rustdoc item kind: `struct`, `trait`, `function`, `module`,
+    /// `assoc_type`, and so on.
+    #[must_use]
+    pub fn kind(self) -> &'a str {
+        self.row.kind.of(&self.index.kinds)
+    }
+
+    /// The item's documentation comment, if it has one.
+    #[must_use]
+    pub fn docs(self) -> Option<&'a str> {
+        (!self.row.docs.is_empty()).then(|| self.row.docs.of(&self.index.prose))
+    }
+
+    /// Whether the item is marked deprecated.
+    #[must_use]
+    pub fn deprecated(self) -> bool {
+        self.row.deprecated
+    }
+
+    /// The final segment of the item's path.
+    #[must_use]
+    pub fn short_name(self) -> &'a str {
+        let path = self.path();
+        path.rsplit("::").next().unwrap_or(path)
+    }
+}
+
+/// Compared by what the item says, not by where it is stored, so that two
+/// indexes built from the same document compare equal.
+impl PartialEq for DocItem<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.path() == other.path()
+            && self.kind() == other.kind()
+            && self.docs() == other.docs()
+            && self.deprecated() == other.deprecated()
+    }
+}
+
+impl Eq for DocItem<'_> {}
 
 /// An item this crate re-exports from another crate.
 ///
@@ -85,31 +168,61 @@ impl DocItem {
 /// re-exported items as belonging to the crate that defines them, and does not
 /// carry their documentation here, so the most useful thing this crate can say
 /// about such an item is where its documentation actually lives.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Reexport {
+#[derive(Clone, Copy, Debug)]
+pub struct Reexport<'a> {
+    index: &'a DocIndex,
+    row: &'a ReexportRow,
+}
+
+impl<'a> Reexport<'a> {
     /// The name this crate exposes the item under.
-    pub name: Box<str>,
+    #[must_use]
+    pub fn name(self) -> &'a str {
+        self.row.name.of(&self.index.reexport_text)
+    }
+
     /// The crate that defines it, as rustdoc names it. A crates.io package name
     /// is usually the same, sometimes with `-` where rustdoc has `_`.
-    pub defining_crate: Box<str>,
+    #[must_use]
+    pub fn defining_crate(self) -> &'a str {
+        self.row.defining_crate.of(&self.index.reexport_text)
+    }
+
     /// The item's full path inside the crate that defines it.
-    pub path: Box<str>,
+    #[must_use]
+    pub fn path(self) -> &'a str {
+        self.row.path.of(&self.index.reexport_text)
+    }
+
     /// The rustdoc item kind.
-    pub kind: Box<str>,
+    #[must_use]
+    pub fn kind(self) -> &'a str {
+        self.row.kind.of(&self.index.reexport_text)
+    }
 }
+
+impl PartialEq for Reexport<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.name() == other.name()
+            && self.defining_crate() == other.defining_crate()
+            && self.path() == other.path()
+            && self.kind() == other.kind()
+    }
+}
+
+impl Eq for Reexport<'_> {}
 
 /// The result of looking an item up by path.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct Lookup<'a> {
     /// The item the query resolved to, if it resolved to exactly one.
-    pub found: Option<&'a DocItem>,
+    pub found: Option<DocItem<'a>>,
     /// Other items that could have been meant, ordered best first.
-    pub suggestions: Vec<&'a DocItem>,
+    pub suggestions: Vec<DocItem<'a>>,
     /// Matching items this crate only re-exports, whose documentation belongs
     /// to another crate. Populated only when nothing local matched.
-    pub reexported: Vec<&'a Reexport>,
+    pub reexported: Vec<Reexport<'a>>,
 }
 
 /// A crate's documentation, indexed by item path.
@@ -117,10 +230,24 @@ pub struct Lookup<'a> {
 pub struct DocIndex {
     crate_version: Option<String>,
     format_version: Option<u64>,
+    /// Every item path, concatenated in item order.
+    paths: Box<str>,
+    /// [`DocIndex::paths`], ASCII-lowercased.
+    ///
+    /// ASCII lowercasing is byte-for-byte length preserving, so a span means
+    /// the same thing in both, and the fuzzy pass reads a lowercase path
+    /// without building one.
+    lowered: Box<str>,
+    /// Every item's documentation, concatenated.
+    prose: Box<str>,
+    /// The distinct kind names, stored once each.
+    kinds: Box<str>,
+    /// Every re-export's name, defining crate, path and kind.
+    reexport_text: Box<str>,
     /// Every documented item of the crate itself, ordered by path.
-    items: Box<[DocItem]>,
+    items: Box<[ItemRow]>,
     /// Items re-exported from other crates, ordered by exposed name.
-    reexports: Box<[Reexport]>,
+    reexports: Box<[ReexportRow]>,
     truncated: bool,
 }
 
@@ -301,8 +428,17 @@ impl DocIndex {
 
     /// Project a deserialized document down to the index this crate keeps.
     fn build(name: &str, root: RustdocRoot) -> Result<Self> {
-        let mut items: Vec<DocItem> = Vec::new();
+        let decode = |message: &str| Error::Decode {
+            url: format!("rustdoc JSON for {name}"),
+            message: message.to_owned(),
+        };
+
+        let mut arenas = Arenas::default();
+        let mut items: Vec<ItemRow> = Vec::new();
         let mut truncated = false;
+        // One buffer reused for every path in the document, rather than a
+        // `join` per item and a `format!` per method.
+        let mut path = String::new();
 
         for (id, summary) in &root.paths {
             if summary.crate_id != 0 || summary.path.is_empty() {
@@ -313,28 +449,41 @@ impl DocIndex {
                 break;
             }
 
-            let path = summary.path.join("::");
+            path.clear();
+            for (position, segment) in summary.path.iter().enumerate() {
+                if position > 0 {
+                    path.push_str("::");
+                }
+                path.push_str(segment);
+            }
+            let owner_len = path.len();
+
             let entry = root.index.get(id);
-            items.push(doc_item(path.clone(), summary.kind.clone(), entry));
+            items.push(arenas.item(&path, &summary.kind, entry));
 
             // `paths` lists only items with a canonical path, which leaves out
             // every method and associated type: the answer to most questions
             // anyone actually asks. Those are reachable through the owning
             // item's body, so they are folded in here.
             if let Some(entry) = entry {
-                collect_associated(&root, entry, &path, &mut items, &mut truncated);
+                collect_associated(
+                    &root,
+                    entry,
+                    &mut path,
+                    owner_len,
+                    &mut arenas,
+                    &mut items,
+                    &mut truncated,
+                );
             }
         }
 
         if items.is_empty() {
-            return Err(Error::Decode {
-                url: format!("rustdoc JSON for {name}"),
-                message: "the document describes no items belonging to this crate".to_owned(),
-            });
+            return Err(decode("the document describes no items belonging to this crate"));
         }
 
-        // A stable order makes lookups deterministic despite the hash maps
-        // above, and lets exact matches use a binary search.
+        // A total order makes lookups deterministic despite the hash maps above,
+        // and lets exact matches use a binary search.
         //
         // Ordering on more than the path is what makes the deduplication below
         // deterministic. Two ids can describe the same path — an item reachable
@@ -342,34 +491,62 @@ impl DocIndex {
         // it hangs off — and ordering on the path alone would leave the
         // survivor to be whichever the hash map happened to yield first. The
         // entry carrying documentation wins, because documentation is the thing
-        // this index exists to serve; the remaining keys only have to be a total
-        // order, so that the answer is the same on every run.
+        // this index exists to serve; the remaining keys only have to make the
+        // order total, so that the answer is the same on every run.
         items.sort_unstable_by(|left, right| {
             left.path
-                .cmp(&right.path)
-                .then_with(|| right.docs.is_some().cmp(&left.docs.is_some()))
-                .then_with(|| left.kind.cmp(&right.kind))
-                .then_with(|| left.docs.cmp(&right.docs))
+                .of(&arenas.paths)
+                .cmp(right.path.of(&arenas.paths))
+                .then_with(|| left.docs.is_empty().cmp(&right.docs.is_empty()))
+                .then_with(|| left.kind.of(&arenas.kinds).cmp(right.kind.of(&arenas.kinds)))
+                .then_with(|| left.docs.of(&arenas.prose).cmp(right.docs.of(&arenas.prose)))
                 .then_with(|| left.deprecated.cmp(&right.deprecated))
         });
-        items.dedup_by(|left, right| left.path == right.path);
+        items.dedup_by(|left, right| left.path.of(&arenas.paths) == right.path.of(&arenas.paths));
 
-        let mut reexports = collect_reexports(&root);
+        let mut reexports = collect_reexports(&root, &mut arenas);
         // Same reasoning: `(name, path)` is what the deduplication compares, so
         // the ordering has to break ties past it or the survivor is arbitrary.
         reexports.sort_unstable_by(|left, right| {
-            (&left.name, &left.path, &left.defining_crate, &left.kind).cmp(&(
-                &right.name,
-                &right.path,
-                &right.defining_crate,
-                &right.kind,
-            ))
+            let text = &arenas.reexport_text;
+            (
+                left.name.of(text),
+                left.path.of(text),
+                left.defining_crate.of(text),
+                left.kind.of(text),
+            )
+                .cmp(&(
+                    right.name.of(text),
+                    right.path.of(text),
+                    right.defining_crate.of(text),
+                    right.kind.of(text),
+                ))
         });
-        reexports.dedup_by(|left, right| left.name == right.name && left.path == right.path);
+        reexports.dedup_by(|left, right| {
+            let text = &arenas.reexport_text;
+            left.name.of(text) == right.name.of(text) && left.path.of(text) == right.path.of(text)
+        });
+
+        // Rewrite every arena in the order the rows are now in. Collection
+        // order is hash-map order, so without this pass the text would be
+        // scattered through the buffers and two parses of the same document
+        // would lay it out differently — which is the difference between an
+        // index that merely answers the same and one that *is* the same.
+        let text = arenas.compact(&mut items, &mut reexports);
+        let lowered = text.paths.to_ascii_lowercase();
+
+        if arenas.overflowed {
+            return Err(decode("the document holds more text than an index can address"));
+        }
 
         Ok(Self {
             crate_version: root.crate_version,
             format_version: root.format_version,
+            paths: text.paths.into_boxed_str(),
+            lowered: lowered.into_boxed_str(),
+            prose: text.prose.into_boxed_str(),
+            kinds: text.kinds.into_boxed_str(),
+            reexport_text: text.reexport_text.into_boxed_str(),
             items: items.into_boxed_slice(),
             reexports: reexports.into_boxed_slice(),
             truncated,
@@ -389,15 +566,13 @@ impl DocIndex {
     }
 
     /// Every documented item, ordered by path.
-    #[must_use]
-    pub fn items(&self) -> &[DocItem] {
-        &self.items
+    pub fn items(&self) -> impl ExactSizeIterator<Item = DocItem<'_>> {
+        (0..self.items.len()).map(|position| self.item(position))
     }
 
     /// Items this crate re-exports from other crates.
-    #[must_use]
-    pub fn reexports(&self) -> &[Reexport] {
-        &self.reexports
+    pub fn reexports(&self) -> impl ExactSizeIterator<Item = Reexport<'_>> {
+        (0..self.reexports.len()).map(|position| self.reexport(position))
     }
 
     /// How many items are indexed.
@@ -424,32 +599,37 @@ impl DocIndex {
     /// Documentation prose dominates and varies by orders of magnitude between
     /// crates, so a cache bounded by entry count would be a poor proxy for
     /// memory use.
+    /// All of it, which is now a sum of buffer lengths rather than a walk.
+    ///
+    /// Counted too: the lowercase copy of the paths, which is real memory the
+    /// arena layout added, and the re-export text, because a facade crate is
+    /// almost all re-exports and leaving them out would understate exactly the
+    /// crates where they dominate.
     #[must_use]
     pub fn weight(&self) -> u32 {
-        let items = self
-            .items
-            .iter()
-            .map(|item| {
-                item.path.len()
-                    + item.kind.len()
-                    + item.docs.as_ref().map_or(0, |docs| docs.len())
-                    + size_of::<DocItem>()
-            })
-            .sum::<usize>();
-        // Counted too: a facade crate is almost all re-exports, so leaving them
-        // out would understate exactly the crates where they dominate.
-        let reexports = self
-            .reexports
-            .iter()
-            .map(|reexport| {
-                reexport.name.len()
-                    + reexport.defining_crate.len()
-                    + reexport.path.len()
-                    + reexport.kind.len()
-                    + size_of::<Reexport>()
-            })
-            .sum::<usize>();
-        u32::try_from(items + reexports).unwrap_or(u32::MAX)
+        let text = self.paths.len()
+            + self.lowered.len()
+            + self.prose.len()
+            + self.kinds.len()
+            + self.reexport_text.len();
+        let rows = self.items.len() * size_of::<ItemRow>()
+            + self.reexports.len() * size_of::<ReexportRow>();
+        u32::try_from(text + rows).unwrap_or(u32::MAX)
+    }
+
+    /// One item as a borrowed view.
+    fn item(&self, position: usize) -> DocItem<'_> {
+        DocItem { index: self, row: &self.items[position] }
+    }
+
+    /// One re-export as a borrowed view.
+    fn reexport(&self, position: usize) -> Reexport<'_> {
+        Reexport { index: self, row: &self.reexports[position] }
+    }
+
+    /// The lowercase form of an item's path, without building one.
+    fn lowered_path(&self, position: usize) -> &str {
+        self.items[position].path.of(&self.lowered)
     }
 
     /// Look an item up by path.
@@ -475,25 +655,27 @@ impl DocIndex {
             return Lookup::default();
         }
 
-        if let Ok(position) = self.items.binary_search_by(|item| (*item.path).cmp(query)) {
+        if let Ok(position) = self.items.binary_search_by(|row| row.path.of(&self.paths).cmp(query))
+        {
             return Lookup {
-                found: Some(&self.items[position]),
+                found: Some(self.item(position)),
                 suggestions: Vec::new(),
                 reexported: Vec::new(),
             };
         }
 
         let suffix = format!("::{query}");
-        let by_suffix: Vec<&DocItem> =
-            self.items.iter().filter(|item| item.path.ends_with(&suffix)).collect();
+        let by_suffix: Vec<DocItem<'_>> = (0..self.items.len())
+            .filter(|&position| self.item(position).path().ends_with(&suffix))
+            .map(|position| self.item(position))
+            .collect();
         if let Some(resolved) = resolve(&by_suffix) {
             return resolved;
         }
 
-        let by_name: Vec<&DocItem> = self
-            .items
-            .iter()
-            .filter(|item| item.short_name().eq_ignore_ascii_case(query))
+        let by_name: Vec<DocItem<'_>> = (0..self.items.len())
+            .filter(|&position| self.item(position).short_name().eq_ignore_ascii_case(query))
+            .map(|position| self.item(position))
             .collect();
         if let Some(resolved) = resolve(&by_name) {
             return resolved;
@@ -508,11 +690,12 @@ impl DocIndex {
             return Lookup { found: None, suggestions: Vec::new(), reexported };
         }
 
+        // The lowercase form of every path is already stored, so this compares
+        // against it rather than building one per item per query.
         let lowered = query.to_ascii_lowercase();
-        let fuzzy: Vec<&DocItem> = self
-            .items
-            .iter()
-            .filter(|item| item.path.to_ascii_lowercase().contains(&lowered))
+        let fuzzy: Vec<DocItem<'_>> = (0..self.items.len())
+            .filter(|&position| self.lowered_path(position).contains(&lowered))
+            .map(|position| self.item(position))
             .collect();
         Lookup { found: None, suggestions: shortlist(fuzzy), reexported: Vec::new() }
     }
@@ -531,55 +714,195 @@ impl DocIndex {
             return Lookup::default();
         }
 
-        if let Ok(position) = self.items.binary_search_by(|item| (*item.path).cmp(query)) {
-            return Lookup {
-                found: Some(&self.items[position]),
-                suggestions: Vec::new(),
-                reexported: Vec::new(),
-            };
+        let all = || (0..self.items.len()).map(|position| self.item(position));
+
+        if let Some(found) = all().find(|item| item.path() == query) {
+            return Lookup { found: Some(found), suggestions: Vec::new(), reexported: Vec::new() };
         }
 
         let suffix = format!("::{query}");
-        let by_suffix: Vec<&DocItem> =
-            self.items.iter().filter(|item| item.path.ends_with(&suffix)).collect();
+        let by_suffix: Vec<DocItem<'_>> =
+            all().filter(|item| item.path().ends_with(&suffix)).collect();
         if let Some(resolved) = resolve(&by_suffix) {
             return resolved;
         }
 
-        let by_name: Vec<&DocItem> = self
-            .items
-            .iter()
-            .filter(|item| item.short_name().eq_ignore_ascii_case(query))
-            .collect();
+        let by_name: Vec<DocItem<'_>> =
+            all().filter(|item| item.short_name().eq_ignore_ascii_case(query)).collect();
         if let Some(resolved) = resolve(&by_name) {
             return resolved;
         }
 
-        let reexported = self.reexported_as(query);
+        let reexported = self.reexported_as_linear(query);
         if !reexported.is_empty() {
             return Lookup { found: None, suggestions: Vec::new(), reexported };
         }
 
+        // Deliberately builds a lowercase copy per item, as the shipped code
+        // did before the lowercase arena existed: the oracle has to be the old
+        // behaviour, not a tidier version of it.
         let lowered = query.to_ascii_lowercase();
-        let fuzzy: Vec<&DocItem> = self
-            .items
-            .iter()
-            .filter(|item| item.path.to_ascii_lowercase().contains(&lowered))
-            .collect();
+        let fuzzy: Vec<DocItem<'_>> =
+            all().filter(|item| item.path().to_ascii_lowercase().contains(&lowered)).collect();
         Lookup { found: None, suggestions: shortlist(fuzzy), reexported: Vec::new() }
+    }
+
+    /// The re-export pass as a linear scan, for the oracle above.
+    #[cfg(test)]
+    fn reexported_as_linear(&self, query: &str) -> Vec<Reexport<'_>> {
+        let wanted = query.rsplit("::").next().unwrap_or(query);
+        let mut matches: Vec<Reexport<'_>> = (0..self.reexports.len())
+            .map(|position| self.reexport(position))
+            .filter(|item| item.name().eq_ignore_ascii_case(wanted))
+            .collect();
+        matches.truncate(MAX_SUGGESTIONS);
+        matches
     }
 
     /// Re-exports whose exposed name matches a query.
     ///
     /// The query is matched against the name this crate exposes, so both
     /// `Frame` and `ratatui::Frame` find the same item.
-    fn reexported_as(&self, query: &str) -> Vec<&Reexport> {
+    fn reexported_as(&self, query: &str) -> Vec<Reexport<'_>> {
         let wanted = query.rsplit("::").next().unwrap_or(query);
-        let mut matches: Vec<&Reexport> =
-            self.reexports.iter().filter(|item| item.name.eq_ignore_ascii_case(wanted)).collect();
+        let mut matches: Vec<Reexport<'_>> = (0..self.reexports.len())
+            .map(|position| self.reexport(position))
+            .filter(|item| item.name().eq_ignore_ascii_case(wanted))
+            .collect();
         matches.truncate(MAX_SUGGESTIONS);
         matches
     }
+}
+
+/// The text buffers an index is assembled into.
+#[derive(Default)]
+struct Arenas {
+    paths: String,
+    prose: String,
+    kinds: String,
+    reexport_text: String,
+    /// Where each distinct kind name landed in [`Arenas::kinds`].
+    ///
+    /// rustdoc names a couple of dozen kinds and repeats them across every item,
+    /// so storing the string once and the span per item is the difference
+    /// between one allocation and fifty thousand.
+    interned_kinds: FastMap<Box<str>, Span>,
+    /// Set when an arena outgrew what a [`Span`] can address, which makes every
+    /// span recorded afterwards meaningless.
+    overflowed: bool,
+}
+
+impl Arenas {
+    /// Append text to an arena and describe where it landed.
+    ///
+    /// A span addresses 4 GiB, and the expanded document is capped well below
+    /// that before it reaches here, so the overflow path is unreachable in
+    /// practice. It is still checked rather than assumed, because a span
+    /// recorded past the ceiling would quietly name the wrong text instead of
+    /// failing.
+    fn push(arena: &mut String, overflowed: &mut bool, text: &str) -> Span {
+        let (Ok(start), Ok(len)) = (u32::try_from(arena.len()), u32::try_from(text.len())) else {
+            *overflowed = true;
+            return Span::default();
+        };
+        if start.checked_add(len).is_none() {
+            *overflowed = true;
+            return Span::default();
+        }
+        arena.push_str(text);
+        Span { start, len }
+    }
+
+    /// The span of a kind name, storing it if this is the first item to use it.
+    fn kind(&mut self, kind: &str) -> Span {
+        if let Some(span) = self.interned_kinds.get(kind) {
+            return *span;
+        }
+        let span = Self::push(&mut self.kinds, &mut self.overflowed, kind);
+        self.interned_kinds.insert(kind.into(), span);
+        span
+    }
+
+    /// Build one item's stored form from a path and the index entry describing
+    /// it.
+    fn item(&mut self, path: &str, kind: &str, entry: Option<&IndexItem>) -> ItemRow {
+        let docs = entry
+            .and_then(|item| item.docs.as_deref())
+            .map(str::trim)
+            .filter(|docs| !docs.is_empty());
+        ItemRow {
+            path: Self::push(&mut self.paths, &mut self.overflowed, path),
+            kind: self.kind(kind),
+            docs: docs.map_or_else(Span::default, |docs| {
+                Self::push(&mut self.prose, &mut self.overflowed, docs)
+            }),
+            deprecated: entry.is_some_and(|item| item.deprecation.is_some()),
+        }
+    }
+
+    /// Rewrite every arena in row order, repointing each row as it goes.
+    ///
+    /// Returns new buffers rather than replacing the old ones in place, because
+    /// copying a buffer onto itself is exactly what cannot be done while it is
+    /// being read.
+    ///
+    /// Two things come out of this. A scan of the path arena now walks forwards
+    /// through memory instead of jumping around it, and the layout is a
+    /// function of the sorted rows alone — so the same document produces the
+    /// same bytes, however the hash maps it was collected through were seeded.
+    fn compact(&mut self, items: &mut [ItemRow], reexports: &mut [ReexportRow]) -> Text {
+        let mut text = Text {
+            paths: String::with_capacity(self.paths.len()),
+            prose: String::with_capacity(self.prose.len()),
+            kinds: String::new(),
+            reexport_text: String::with_capacity(self.reexport_text.len()),
+        };
+        // Kinds are re-interned in first-seen order over the sorted rows, which
+        // is deterministic where their collection order was not.
+        let mut kinds: FastMap<Box<str>, Span> = FastMap::default();
+
+        for row in items {
+            let path = Self::push(&mut text.paths, &mut self.overflowed, row.path.of(&self.paths));
+            let docs = if row.docs.is_empty() {
+                Span::default()
+            } else {
+                Self::push(&mut text.prose, &mut self.overflowed, row.docs.of(&self.prose))
+            };
+            let name = row.kind.of(&self.kinds);
+            let kind = match kinds.get(name) {
+                Some(span) => *span,
+                None => {
+                    let span = Self::push(&mut text.kinds, &mut self.overflowed, name);
+                    kinds.insert(name.into(), span);
+                    span
+                },
+            };
+            row.path = path;
+            row.docs = docs;
+            row.kind = kind;
+        }
+
+        for row in reexports {
+            let source = &self.reexport_text;
+            let target = &mut text.reexport_text;
+            let overflowed = &mut self.overflowed;
+            let name = Self::push(target, overflowed, row.name.of(source));
+            let defining_crate = Self::push(target, overflowed, row.defining_crate.of(source));
+            let path = Self::push(target, overflowed, row.path.of(source));
+            let kind = Self::push(target, overflowed, row.kind.of(source));
+            *row = ReexportRow { name, defining_crate, path, kind };
+        }
+
+        text
+    }
+}
+
+/// The arenas an index keeps, once compacted.
+struct Text {
+    paths: String,
+    prose: String,
+    kinds: String,
+    reexport_text: String,
 }
 
 /// Collect the items this crate re-exports from other crates.
@@ -588,66 +911,76 @@ impl DocIndex {
 /// separates a genuine re-export from the thousands of foreign items the path
 /// table mentions merely because something references them. For `ratatui` that
 /// is the difference between 125 entries and 6805.
-fn collect_reexports(root: &RustdocRoot) -> Vec<Reexport> {
+fn collect_reexports(root: &RustdocRoot, arenas: &mut Arenas) -> Vec<ReexportRow> {
     // The tables are keyed by the decimal form of an id, and `HashMap<String,
     // _>` looks up by `&str`, so the digits are written into a stack buffer
     // rather than a `String` that exists only long enough to be hashed.
     let mut id = itoa::Buffer::new();
-    root.index
-        .values()
-        .filter_map(|item| {
-            let (kind, body) = item.classify()?;
-            if kind != "use" {
-                return None;
+    // As for item paths: one reusable buffer instead of a `join` per re-export.
+    let mut path = String::new();
+    let mut rows: Vec<ReexportRow> = Vec::new();
+
+    for item in root.index.values() {
+        if rows.len() >= MAX_ITEMS {
+            break;
+        }
+        let Some((kind, body)) = item.classify() else {
+            continue;
+        };
+        if kind != "use" {
+            continue;
+        }
+        let Some(target) = body.target.and_then(|target| root.paths.get(id.format(target))) else {
+            continue;
+        };
+        if target.crate_id == 0 || target.path.is_empty() {
+            continue;
+        }
+        // A crate this document does not name cannot be looked up, and the
+        // whole value of a re-export entry is telling a caller where to go
+        // next, so an unnamed one is dropped rather than described.
+        let Some(defining_crate) = root.external_crates.get(id.format(target.crate_id)) else {
+            continue;
+        };
+        if defining_crate.name.is_empty() {
+            continue;
+        }
+        let Some(name) = body.alias.as_deref().or(item.name.as_deref()) else {
+            continue;
+        };
+
+        path.clear();
+        for (position, segment) in target.path.iter().enumerate() {
+            if position > 0 {
+                path.push_str("::");
             }
-            let target = root.paths.get(id.format(body.target?))?;
-            if target.crate_id == 0 || target.path.is_empty() {
-                return None;
-            }
-            // A crate this document does not name cannot be looked up, and the
-            // whole value of a re-export entry is telling a caller where to go
-            // next, so an unnamed one is dropped rather than described.
-            let defining_crate = root.external_crates.get(id.format(target.crate_id))?;
-            if defining_crate.name.is_empty() {
-                return None;
-            }
-            Some(Reexport {
-                name: body.alias.clone().or_else(|| item.name.clone())?.into_boxed_str(),
-                defining_crate: defining_crate.name.as_str().into(),
-                path: target.path.join("::").into_boxed_str(),
-                kind: target.kind.clone().into_boxed_str(),
-            })
-        })
-        .take(MAX_ITEMS)
-        .collect()
+            path.push_str(segment);
+        }
+
+        let text = &mut arenas.reexport_text;
+        let overflowed = &mut arenas.overflowed;
+        rows.push(ReexportRow {
+            name: Arenas::push(text, overflowed, name),
+            defining_crate: Arenas::push(text, overflowed, &defining_crate.name),
+            path: Arenas::push(text, overflowed, &path),
+            kind: Arenas::push(text, overflowed, &target.kind),
+        });
+    }
+    rows
 }
 
 /// Turn a set of candidates into a resolution, if there is anything to resolve.
-fn resolve<'a>(candidates: &[&'a DocItem]) -> Option<Lookup<'a>> {
+fn resolve<'a>(candidates: &[DocItem<'a>]) -> Option<Lookup<'a>> {
     match candidates {
         [] => None,
         [only] => {
-            Some(Lookup { found: Some(only), suggestions: Vec::new(), reexported: Vec::new() })
+            Some(Lookup { found: Some(*only), suggestions: Vec::new(), reexported: Vec::new() })
         },
         many => Some(Lookup {
             found: None,
             suggestions: shortlist(many.to_vec()),
             reexported: Vec::new(),
         }),
-    }
-}
-
-/// Build one [`DocItem`] from a path and the index entry describing it.
-fn doc_item(path: String, kind: String, entry: Option<&IndexItem>) -> DocItem {
-    DocItem {
-        path: path.into_boxed_str(),
-        kind: kind.into_boxed_str(),
-        docs: entry
-            .and_then(|item| item.docs.as_deref())
-            .map(str::trim)
-            .filter(|docs| !docs.is_empty())
-            .map(Box::from),
-        deprecated: entry.is_some_and(|item| item.deprecation.is_some()),
     }
 }
 
@@ -660,8 +993,10 @@ fn doc_item(path: String, kind: String, entry: Option<&IndexItem>) -> DocItem {
 fn collect_associated(
     root: &RustdocRoot,
     owner: &IndexItem,
-    owner_path: &str,
-    items: &mut Vec<DocItem>,
+    path: &mut String,
+    owner_len: usize,
+    arenas: &mut Arenas,
+    items: &mut Vec<ItemRow>,
     truncated: &mut bool,
 ) {
     let Some((kind, body)) = owner.classify() else {
@@ -698,15 +1033,21 @@ fn collect_associated(
             continue;
         };
         let child_kind = child.classify().map_or("item", |(kind, _)| kind);
-        items.push(doc_item(format!("{owner_path}::{name}"), child_kind.to_owned(), Some(child)));
+        // The owner's path is already in the buffer; each child only appends
+        // its own segment and then hands the buffer back.
+        path.truncate(owner_len);
+        path.push_str("::");
+        path.push_str(name);
+        items.push(arenas.item(path, child_kind, Some(child)));
     }
 }
 
 /// Keep suggestion lists short enough to be read, preferring shorter paths,
 /// which are the more likely intent.
-fn shortlist(mut items: Vec<&DocItem>) -> Vec<&DocItem> {
-    items
-        .sort_by(|left, right| (left.path.len(), &left.path).cmp(&(right.path.len(), &right.path)));
+fn shortlist(mut items: Vec<DocItem<'_>>) -> Vec<DocItem<'_>> {
+    items.sort_by(|left, right| {
+        (left.path().len(), left.path()).cmp(&(right.path().len(), right.path()))
+    });
     items.truncate(MAX_SUGGESTIONS);
     items
 }
@@ -835,7 +1176,7 @@ mod tests {
     }
 
     fn paths(index: &DocIndex) -> Vec<&str> {
-        index.items().iter().map(|item| item.path.as_ref()).collect()
+        index.items().map(|item| item.path()).collect()
     }
 
     #[test]
@@ -845,7 +1186,7 @@ mod tests {
         assert_eq!(index.format_version(), Some(60));
         assert!(!index.is_truncated());
         assert!(
-            index.items().iter().all(|item| item.path.starts_with("demo")),
+            index.items().all(|item| item.path().starts_with("demo")),
             "a dependency's items are not this crate's documentation"
         );
     }
@@ -857,11 +1198,11 @@ mod tests {
         let index = index();
         let method =
             index.lookup("demo::de::Deserializer::deserialize_any").found.expect("resolves");
-        assert_eq!(method.kind.as_ref(), "function");
-        assert_eq!(method.docs.as_deref(), Some("Deserialize anything."));
+        assert_eq!(method.kind(), "function");
+        assert_eq!(method.docs(), Some("Deserialize anything."));
 
         let assoc = index.lookup("demo::de::Deserializer::Error").found.expect("resolves");
-        assert_eq!(assoc.kind.as_ref(), "assoc_type");
+        assert_eq!(assoc.kind(), "assoc_type");
     }
 
     #[test]
@@ -881,47 +1222,47 @@ mod tests {
         // is canonically `demo::value::Value`.
         let index = index();
         let found = index.lookup("Value::as_str").found.expect("resolves");
-        assert_eq!(found.path.as_ref(), "demo::value::Value::as_str");
+        assert_eq!(found.path(), "demo::value::Value::as_str");
     }
 
     #[test]
     fn a_macro_body_that_is_not_an_object_does_not_break_parsing() {
         let index = index();
         let found = index.lookup("demo::shout").found.expect("resolves");
-        assert_eq!(found.kind.as_ref(), "macro");
-        assert_eq!(found.docs.as_deref(), Some("Shout."));
+        assert_eq!(found.kind(), "macro");
+        assert_eq!(found.docs(), Some("Shout."));
     }
 
     #[test]
     fn documentation_is_trimmed_and_absent_docs_stay_absent() {
         let index = index();
         let found = index.lookup("demo::de::Deserializer").found.expect("resolves");
-        assert_eq!(found.docs.as_deref(), Some("A data format that can deserialize."));
-        assert_eq!(found.kind.as_ref(), "trait");
+        assert_eq!(found.docs(), Some("A data format that can deserialize."));
+        assert_eq!(found.kind(), "trait");
 
         let undocumented = index.lookup("demo::ser::Serializer").found.expect("resolves");
-        assert_eq!(undocumented.docs, None);
+        assert_eq!(undocumented.docs(), None);
     }
 
     #[test]
     fn deprecation_is_recorded() {
         let index = index();
-        assert!(index.lookup("demo::Legacy").found.expect("resolves").deprecated);
-        assert!(!index.lookup("demo::de::Deserializer").found.expect("resolves").deprecated);
+        assert!(index.lookup("demo::Legacy").found.expect("resolves").deprecated());
+        assert!(!index.lookup("demo::de::Deserializer").found.expect("resolves").deprecated());
     }
 
     #[test]
     fn lookup_resolves_a_unique_path_suffix() {
         let index = index();
         let found = index.lookup("de::Deserializer").found.expect("resolves");
-        assert_eq!(found.path.as_ref(), "demo::de::Deserializer");
+        assert_eq!(found.path(), "demo::de::Deserializer");
     }
 
     #[test]
     fn lookup_resolves_a_unique_bare_type_name_case_insensitively() {
         let index = index();
         let found = index.lookup("deserializer").found.expect("resolves");
-        assert_eq!(found.path.as_ref(), "demo::de::Deserializer");
+        assert_eq!(found.path(), "demo::de::Deserializer");
     }
 
     #[test]
@@ -929,8 +1270,7 @@ mod tests {
         let index = index();
         let result = index.lookup("Error");
         assert!(result.found.is_none(), "three items named Error must not resolve to one");
-        let suggested: Vec<&str> =
-            result.suggestions.iter().map(|item| item.path.as_ref()).collect();
+        let suggested: Vec<&str> = result.suggestions.iter().map(|item| item.path()).collect();
         assert_eq!(
             suggested,
             ["demo::de::Error", "demo::ser::Error", "demo::de::Deserializer::Error"],
@@ -947,8 +1287,7 @@ mod tests {
         // first.
         let result = index.lookup("serial");
         assert!(result.found.is_none());
-        let suggested: Vec<&str> =
-            result.suggestions.iter().map(|item| item.path.as_ref()).collect();
+        let suggested: Vec<&str> = result.suggestions.iter().map(|item| item.path()).collect();
         assert_eq!(
             suggested,
             [
@@ -982,10 +1321,10 @@ mod tests {
         let [reexport] = result.reexported.as_slice() else {
             panic!("expected exactly one re-export, got {:?}", result.reexported);
         };
-        assert_eq!(reexport.name.as_ref(), "Frame");
-        assert_eq!(reexport.defining_crate.as_ref(), "demo_core");
-        assert_eq!(reexport.path.as_ref(), "demo_core::frame::Frame");
-        assert_eq!(reexport.kind.as_ref(), "struct");
+        assert_eq!(reexport.name(), "Frame");
+        assert_eq!(reexport.defining_crate(), "demo_core");
+        assert_eq!(reexport.path(), "demo_core::frame::Frame");
+        assert_eq!(reexport.kind(), "struct");
     }
 
     #[test]
@@ -1013,20 +1352,17 @@ mod tests {
         }"#;
         let index = DocIndex::parse("demo", anonymous.as_bytes()).expect("parses");
 
-        assert!(index.reexports().is_empty());
+        assert_eq!(index.reexports().len(), 0);
         assert!(index.lookup("Thing").reexported.is_empty());
     }
 
     #[test]
     fn the_weight_counts_reexports_as_well_as_items() {
         let index = index();
-        assert!(!index.reexports().is_empty(), "the fixture has one");
+        assert_eq!(index.reexports().len(), 1, "the fixture has one");
 
-        let counted: usize = index
-            .reexports()
-            .iter()
-            .map(|reexport| reexport.name.len() + reexport.path.len())
-            .sum();
+        let counted: usize =
+            index.reexports().map(|reexport| reexport.name().len() + reexport.path().len()).sum();
         assert!(
             index.weight() as usize > counted,
             "a facade crate is almost all re-exports; leaving them out understates it"
@@ -1061,14 +1397,14 @@ mod tests {
             result.suggestions
         );
         assert_eq!(result.reexported.len(), 1);
-        assert_eq!(result.reexported[0].path.as_ref(), "demo_core::frame::Frame");
+        assert_eq!(result.reexported[0].path(), "demo_core::frame::Frame");
     }
 
     #[test]
     fn a_local_item_wins_over_a_reexport_of_the_same_name() {
         let index = index();
         let found = index.lookup("demo::Legacy").found.expect("resolves locally");
-        assert_eq!(found.path.as_ref(), "demo::Legacy");
+        assert_eq!(found.path(), "demo::Legacy");
         assert!(index.lookup("demo::Legacy").reexported.is_empty());
     }
 
@@ -1187,14 +1523,12 @@ mod tests {
         assert_eq!(shipped.is_truncated(), referee.is_truncated(), "{label}: truncated");
 
         assert_eq!(shipped.len(), referee.len(), "{label}: item count");
-        for (position, (left, right)) in shipped.items().iter().zip(referee.items()).enumerate() {
+        for (position, (left, right)) in shipped.items().zip(referee.items()).enumerate() {
             assert_eq!(left, right, "{label}: item {position}");
         }
 
         assert_eq!(shipped.reexports().len(), referee.reexports().len(), "{label}: re-exports");
-        for (position, (left, right)) in
-            shipped.reexports().iter().zip(referee.reexports()).enumerate()
-        {
+        for (position, (left, right)) in shipped.reexports().zip(referee.reexports()).enumerate() {
             assert_eq!(left, right, "{label}: re-export {position}");
         }
 
@@ -1286,8 +1620,8 @@ mod tests {
             "zzqxnotpresent".to_owned(),
             "::::".to_owned(),
         ];
-        for item in index.items().iter().step_by(stride.max(1)) {
-            let path = item.path.as_ref();
+        for item in index.items().step_by(stride.max(1)) {
+            let path = item.path();
             let short = item.short_name();
             queries.push(path.to_owned());
             queries.push(format!("::{path}"));
@@ -1306,8 +1640,8 @@ mod tests {
         // Every re-export by the name the crate exposes, which is the only way
         // to reach the re-export step.
         for reexport in index.reexports() {
-            queries.push(reexport.name.to_string());
-            queries.push(reexport.name.to_ascii_lowercase());
+            queries.push(reexport.name().to_owned());
+            queries.push(reexport.name().to_ascii_lowercase());
         }
         queries
     }
@@ -1360,7 +1694,7 @@ mod tests {
         // equivalence test above, because both implementations would agree on
         // the step it did reach. These assertions pin what each case is for.
         let index = index();
-        let resolved = |query: &str| index.lookup(query).found.map(|item| item.path.to_string());
+        let resolved = |query: &str| index.lookup(query).found.map(|item| item.path().to_owned());
 
         assert_eq!(resolved("demo::de::Deserializer").as_deref(), Some("demo::de::Deserializer"));
         assert_eq!(resolved("::demo::Legacy").as_deref(), Some("demo::Legacy"));
@@ -1413,8 +1747,8 @@ mod tests {
         let first = DocIndex::parse("demo", COLLIDING.as_bytes()).expect("parses");
 
         let thing = first.lookup("demo::Thing").found.expect("resolves");
-        assert_eq!(thing.docs.as_deref(), Some("The documented one."));
-        assert_eq!(thing.kind.as_ref(), "enum", "the documented entry brings its own kind");
+        assert_eq!(thing.docs(), Some("The documented one."));
+        assert_eq!(thing.kind(), "enum", "the documented entry brings its own kind");
 
         // Repeated because the failure this guards against is probabilistic:
         // one parse could agree with the rule by luck.
@@ -1427,13 +1761,12 @@ mod tests {
     #[test]
     fn two_reexports_agreeing_on_name_and_path_resolve_the_same_way_every_time() {
         let first = DocIndex::parse("demo", COLLIDING.as_bytes()).expect("parses");
-        let [reexport] = first.reexports() else {
-            panic!("expected one survivor, got {:?}", first.reexports());
-        };
+        assert_eq!(first.reexports().len(), 1, "one survivor, not two");
+        let reexport = first.reexports().next().expect("the survivor");
         // `alpha` and `beta` both expose `Shared` at `dep::Shared`; the
         // deduplication compares only `(name, path)`, so the ordering has to
         // decide, and it decides on the defining crate.
-        assert_eq!(reexport.defining_crate.as_ref(), "alpha");
+        assert_eq!(reexport.defining_crate(), "alpha");
 
         for attempt in 1..32 {
             let again = DocIndex::parse("demo", COLLIDING.as_bytes()).expect("parses");
