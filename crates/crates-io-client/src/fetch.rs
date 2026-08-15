@@ -639,6 +639,13 @@ fn extract_detail(body: &[u8]) -> Option<String> {
     if body.is_empty() {
         return None;
     }
+    // The crates.io error shape. This branch is the third site the provenance
+    // argument in [`is_markup`] rests on, alongside that rule and the trim
+    // below it: what makes the result safe to report unframed is that crates.io
+    // composes these strings. Widening what is read out of an error body — a
+    // field that echoes something a publisher chose, rather than a message
+    // crates.io wrote — is the change that would break it, and the other two
+    // sites are worth re-reading before making it.
     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body)
         && let Some(errors) = value.get("errors").and_then(serde_json::Value::as_array)
     {
