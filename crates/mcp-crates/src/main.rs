@@ -120,7 +120,12 @@ impl Cli {
     }
 }
 
-#[tokio::main]
+// A stdio server talks to one client over one pipe, and its concurrency is a
+// handful of tool calls rather than a request flood. One worker per core buys
+// nothing against that and costs a thread stack and a scheduler queue each. The
+// blocking pool, which is where documentation is actually parsed, is sized
+// separately and is untouched by this.
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 

@@ -73,6 +73,19 @@ pub struct Config {
     /// Ceiling on the disk cache, enforced by deleting the oldest entries at
     /// startup.
     pub disk_cache_capacity_bytes: u64,
+
+    /// How many rustdoc documents may be expanded and parsed at the same time.
+    ///
+    /// The coalescing gate deduplicates identical requests but says nothing
+    /// about distinct ones. Expanding a document holds the compressed body, the
+    /// expanded bytes and the parsed structure at once, so without a ceiling a
+    /// handful of concurrent lookups across different crates add up to more
+    /// memory than the machine has.
+    ///
+    /// Configurable rather than constant because the right value depends on how
+    /// much memory the host has and how large the documents being read are,
+    /// which is a deployment question rather than a library one.
+    pub concurrent_doc_parses: usize,
 }
 
 impl Config {
@@ -95,9 +108,18 @@ impl Config {
             disk_cache: true,
             cache_dir: None,
             disk_cache_capacity_bytes: crate::disk::DEFAULT_CACHE_CAPACITY_BYTES,
+            concurrent_doc_parses: DEFAULT_CONCURRENT_DOC_PARSES,
         }
     }
 }
+
+/// How many rustdoc documents may be expanded and parsed at the same time by
+/// default.
+///
+/// Two, because the memory each parse holds is the binding constraint rather
+/// than the CPU it uses, and two is what keeps a pair of concurrent lookups on
+/// large crates inside a sensible footprint.
+pub const DEFAULT_CONCURRENT_DOC_PARSES: usize = 2;
 
 /// How long a given class of response stays servable without contacting the
 /// origin.

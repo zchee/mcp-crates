@@ -92,7 +92,7 @@ pub use crate::{
         Category as CrateCategory, CrateResponse, CrateSummary, Include, Keyword, SearchMeta,
         SearchParams, SearchResponse, Sort,
     },
-    config::{Config, Ttl},
+    config::{Config, DEFAULT_CONCURRENT_DOC_PARSES, Ttl},
     disk::{DEFAULT_CACHE_CAPACITY_BYTES, Store as DiskStore},
     docs::{BuildStatus, DocIndex, DocItem, Lookup, Reexport},
     error::{Category, Error, Result},
@@ -111,15 +111,6 @@ const DOC_INDEX_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
 
 /// How many crate versions may have a documentation gate at once.
 const DOC_GATE_CAPACITY: u64 = 256;
-
-/// How many rustdoc documents may be expanded and parsed at the same time.
-///
-/// The gate above deduplicates identical requests but says nothing about
-/// distinct ones. Expanding a document holds the compressed body, the expanded
-/// bytes and the parsed structure at once, so without a ceiling a handful of
-/// concurrent lookups across different crates add up to more memory than the
-/// machine has.
-const CONCURRENT_DOC_PARSES: usize = 2;
 
 /// A client for crates.io, its sparse index, and docs.rs.
 ///
@@ -191,7 +182,7 @@ impl Client {
                 .time_to_live(ttl.rustdoc)
                 .build(),
             doc_gates: Gates::new(DOC_GATE_CAPACITY),
-            doc_parses: tokio::sync::Semaphore::new(CONCURRENT_DOC_PARSES),
+            doc_parses: tokio::sync::Semaphore::new(config.concurrent_doc_parses.max(1)),
             max_rustdoc_bytes: config.max_rustdoc_bytes,
             disk,
             disk_hits: AtomicU64::new(0),
