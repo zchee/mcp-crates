@@ -30,7 +30,7 @@
 
 use std::{sync::LazyLock, time::Duration};
 
-use crates_io_client::{CrateIndex, DocIndex, Lookup, docs, readme, synthetic};
+use crates_io_client::{CrateIndex, DocIndex, Lookup, disk::Store, docs, readme, synthetic};
 use criterion::{Criterion, measurement::WallTime};
 
 /// The allocator the server binary installs.
@@ -58,6 +58,7 @@ fn main() {
     lookup_regex(&mut criterion);
     lookup_synthetic_50k(&mut criterion);
     documents(&mut criterion);
+    disk_cache(&mut criterion);
     criterion.final_summary();
 }
 
@@ -229,6 +230,46 @@ fn lookup_synthetic_50k(criterion: &mut Criterion<WallTime>) {
     });
     group.bench_function("fuzzy_miss", |bencher| bencher.iter(|| SYNTHETIC_INDEX.lookup(MISS)));
     group.finish();
+}
+
+/// Reading an index back from the disk cache, against parsing it again.
+///
+/// The comparison the cache exists to win: a warm session does the left-hand
+/// column, a cold one does `parse` above.
+fn disk_cache(criterion: &mut Criterion<WallTime>) {
+    let root = std::env::temp_dir().join(format!("mcp-crates-bench-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let store = Store::at(&root);
+
+    let regex = REGEX.parse();
+    let synthetic = DocIndex::parse("synth", SYNTHETIC.as_bytes()).expect("parses");
+    store.store("regex@1.11.1", &regex.to_stored()).expect("stores");
+    store.store("synth@0.1.0", &synthetic.to_stored()).expect("stores");
+
+    let mut group = criterion.benchmark_group("disk_cache");
+    group.measurement_time(SLOW_MEASUREMENT);
+    group.bench_function("load_regex", |bencher| {
+        bencher.iter(|| {
+            let stored = store
+                .load::<docs::StoredIndex>("regex@1.11.1")
+                .expect("no error")
+                .expect("present");
+            DocIndex::from_stored(stored)
+        });
+    });
+    group.bench_function("load_synthetic_50k", |bencher| {
+        bencher.iter(|| {
+            let stored =
+                store.load::<docs::StoredIndex>("synth@0.1.0").expect("no error").expect("present");
+            DocIndex::from_stored(stored)
+        });
+    });
+    group.bench_function("store_regex", |bencher| {
+        bencher.iter(|| store.store("regex@1.11.1", &regex.to_stored()).expect("stores"));
+    });
+    group.finish();
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The two parse paths that are not rustdoc JSON.

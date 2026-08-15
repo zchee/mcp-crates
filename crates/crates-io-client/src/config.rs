@@ -1,6 +1,6 @@
 //! Tunable transport and cache limits.
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
 /// Transport, pacing and cache limits for a [`crate::Client`].
 ///
@@ -57,6 +57,22 @@ pub struct Config {
 
     /// How many times a transient failure is retried before giving up.
     pub max_retries: u32,
+
+    /// Whether parsed documentation may be kept on disk between runs.
+    ///
+    /// The server is spawned per client session, so without this every session
+    /// re-downloads and re-parses rustdoc JSON that cannot have changed.
+    pub disk_cache: bool,
+
+    /// Where to keep it, or `None` to use the platform's cache directory.
+    ///
+    /// Exists so that a test can point at a directory it owns, and so that a
+    /// caller who keeps their caches somewhere specific can say so.
+    pub cache_dir: Option<PathBuf>,
+
+    /// Ceiling on the disk cache, enforced by deleting the oldest entries at
+    /// startup.
+    pub disk_cache_capacity_bytes: u64,
 }
 
 impl Config {
@@ -76,6 +92,9 @@ impl Config {
             max_body_bytes: 16 * 1024 * 1024,
             max_rustdoc_bytes: 48 * 1024 * 1024,
             max_retries: 3,
+            disk_cache: true,
+            cache_dir: None,
+            disk_cache_capacity_bytes: crate::disk::DEFAULT_CACHE_CAPACITY_BYTES,
         }
     }
 }

@@ -13,7 +13,7 @@
 use std::{borrow::Cow, collections::HashMap, fmt};
 
 use serde::{
-    Deserialize, Deserializer,
+    Deserialize, Deserializer, Serialize,
     de::{IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 
@@ -61,7 +61,7 @@ pub struct BuildStatus {
 /// handful of contiguous buffers rather than in an allocation of its own. A
 /// crate at the item ceiling used to mean a few hundred thousand small
 /// `Box<str>`s; it now means five buffers and a flat array of records.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Span {
     start: u32,
     len: u32,
@@ -87,7 +87,7 @@ impl Span {
 }
 
 /// One item, as stored: four spans and a flag, with no text of its own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct ItemRow {
     path: Span,
     kind: Span,
@@ -96,7 +96,7 @@ struct ItemRow {
 }
 
 /// One re-export, as stored.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct ReexportRow {
     name: Span,
     defining_crate: Span,
@@ -300,6 +300,27 @@ fn trigrams_of(lowered: &str) -> Box<[u64]> {
         set[slot / 64] |= 1 << (slot % 64);
     }
     set.into_boxed_slice()
+}
+
+/// An index in the form it is written to disk.
+///
+/// Only the parts read out of the document. The lowercase arena, the two name
+/// orderings and the trigram set are all functions of these fields and are
+/// rebuilt on load rather than stored: the lowercase arena alone is as large as
+/// the paths it mirrors, so storing them would roughly double the file to save
+/// work measured in milliseconds.
+#[doc(hidden)]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StoredIndex {
+    crate_version: Option<String>,
+    format_version: Option<u64>,
+    paths: String,
+    prose: String,
+    kinds: String,
+    reexport_text: String,
+    items: Vec<ItemRow>,
+    reexports: Vec<ReexportRow>,
+    truncated: bool,
 }
 
 /// Only the parts of the rustdoc JSON schema this crate reads.
@@ -642,19 +663,52 @@ impl DocIndex {
         // would lay it out differently — which is the difference between an
         // index that merely answers the same and one that *is* the same.
         let text = arenas.compact(&mut items, &mut reexports);
-        let lowered = text.paths.to_ascii_lowercase();
-        let trigrams = trigrams_of(&lowered);
 
         if arenas.overflowed {
             return Err(decode("the document holds more text than an index can address"));
         }
 
+        Ok(Self::assemble(StoredIndex {
+            crate_version: root.crate_version,
+            format_version: root.format_version,
+            paths: text.paths,
+            prose: text.prose,
+            kinds: text.kinds,
+            reexport_text: text.reexport_text,
+            items,
+            reexports,
+            truncated,
+        }))
+    }
+
+    /// Everything an index keeps that is not read out of the document.
+    ///
+    /// Shared by parsing and by loading from the disk cache, so an index read
+    /// back off disk is assembled by exactly the code that built it the first
+    /// time — and is therefore equal to it, which a round-trip test asserts
+    /// rather than assumes.
+    fn assemble(stored: StoredIndex) -> Self {
+        let StoredIndex {
+            crate_version,
+            format_version,
+            paths,
+            prose,
+            kinds,
+            reexport_text,
+            items,
+            reexports,
+            truncated,
+        } = stored;
+
+        let lowered = paths.to_ascii_lowercase();
+        let trigrams = trigrams_of(&lowered);
+
         // Built last, because a position only means something once the rows
-        // have stopped moving.
-        // Each name is located once, not once per comparison. Finding the last
-        // `::` means constructing a substring searcher, and a sort does n log n
-        // comparisons — for a document at the ceiling that is the difference
-        // between fifty thousand searches and eight hundred thousand.
+        // have stopped moving. Each name is located once, not once per
+        // comparison: finding the last `::` means constructing a substring
+        // searcher, and a sort does n log n comparisons — for a document at the
+        // ceiling that is the difference between fifty thousand searches and
+        // eight hundred thousand.
         let mut named: Vec<(Span, u32)> = (0..items.len() as u32)
             .map(|position| {
                 let span = items[position as usize].path;
@@ -668,27 +722,52 @@ impl DocIndex {
             left.0.of(&lowered).cmp(right.0.of(&lowered)).then(left.1.cmp(&right.1))
         });
         let by_name: Vec<u32> = named.into_iter().map(|(_, position)| position).collect();
+
         let mut reexports_by_name: Vec<u32> = (0..reexports.len() as u32).collect();
         reexports_by_name.sort_unstable_by(|&left, &right| {
-            let name = |position: u32| reexports[position as usize].name.of(&text.reexport_text);
+            let name = |position: u32| reexports[position as usize].name.of(&reexport_text);
             cmp_ignore_ascii_case(name(left), name(right)).then(left.cmp(&right))
         });
 
-        Ok(Self {
-            crate_version: root.crate_version,
-            format_version: root.format_version,
-            paths: text.paths.into_boxed_str(),
+        Self {
+            crate_version,
+            format_version,
+            paths: paths.into_boxed_str(),
             lowered: lowered.into_boxed_str(),
-            prose: text.prose.into_boxed_str(),
-            kinds: text.kinds.into_boxed_str(),
-            reexport_text: text.reexport_text.into_boxed_str(),
+            prose: prose.into_boxed_str(),
+            kinds: kinds.into_boxed_str(),
+            reexport_text: reexport_text.into_boxed_str(),
             items: items.into_boxed_slice(),
             reexports: reexports.into_boxed_slice(),
             by_name: by_name.into_boxed_slice(),
             reexports_by_name: reexports_by_name.into_boxed_slice(),
             trigrams,
             truncated,
-        })
+        }
+    }
+
+    /// The index in the form the disk cache stores.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn to_stored(&self) -> StoredIndex {
+        StoredIndex {
+            crate_version: self.crate_version.clone(),
+            format_version: self.format_version,
+            paths: self.paths.to_string(),
+            prose: self.prose.to_string(),
+            kinds: self.kinds.to_string(),
+            reexport_text: self.reexport_text.to_string(),
+            items: self.items.to_vec(),
+            reexports: self.reexports.to_vec(),
+            truncated: self.truncated,
+        }
+    }
+
+    /// Rebuild an index from what the disk cache stored.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_stored(stored: StoredIndex) -> Self {
+        Self::assemble(stored)
     }
 
     /// The crate version the documentation was generated from.
@@ -2007,6 +2086,19 @@ mod tests {
         for attempt in 1..32 {
             let again = DocIndex::parse("demo", COLLIDING.as_bytes()).expect("parses");
             assert_eq!(again, first, "parse {attempt} disagreed with parse 0");
+        }
+    }
+
+    #[test]
+    fn an_index_survives_a_trip_through_the_stored_form_unchanged() {
+        // The disk cache stores only what was read out of the document and
+        // rebuilds everything else on load. This says the rebuild produces the
+        // same index rather than a similar one — `DocIndex` derives equality
+        // over every field, including the lowercase arena, both orderings and
+        // the trigram set, so a rebuild that differed anywhere would fail here.
+        for (label, index) in equivalence_corpus() {
+            let restored = DocIndex::from_stored(index.to_stored());
+            assert_eq!(restored, index, "{label}: the stored form lost something");
         }
     }
 

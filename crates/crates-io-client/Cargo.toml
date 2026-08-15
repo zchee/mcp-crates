@@ -11,7 +11,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The `derive` default feature is off: bitcode is used through its serde
+# integration, so the derive macro — and the unsafe this crate forbids — is not
+# in the build.
+bitcode.workspace = true
 bytes.workspace = true
+directories.workspace = true
 foldhash.workspace = true
 htmd.workspace = true
 itoa.workspace = true

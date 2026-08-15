@@ -69,13 +69,21 @@ mod version;
 // and the parity suite need. Hidden because the supported surface is still the
 // re-exports below, which is where the documentation lives.
 #[doc(hidden)]
+pub mod disk;
+#[doc(hidden)]
 pub mod docs;
 #[doc(hidden)]
 pub mod readme;
 #[doc(hidden)]
 pub mod synthetic;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use moka::future::Cache;
 
@@ -85,6 +93,7 @@ pub use crate::{
         SearchParams, SearchResponse, Sort,
     },
     config::{Config, Ttl},
+    disk::{DEFAULT_CACHE_CAPACITY_BYTES, Store as DiskStore},
     docs::{BuildStatus, DocIndex, DocItem, Lookup, Reexport},
     error::{Category, Error, Result},
     fetch::{Origin, Stats},
@@ -124,6 +133,10 @@ pub struct Client {
     doc_gates: Gates,
     doc_parses: tokio::sync::Semaphore,
     max_rustdoc_bytes: usize,
+    /// Where parsed documentation survives between runs, when it may.
+    disk: Option<DiskStore>,
+    disk_hits: AtomicU64,
+    disk_writes: AtomicU64,
 }
 
 impl Client {
@@ -143,6 +156,32 @@ impl Client {
     ///
     /// As [`Client::new`].
     pub fn with_ttl(config: Config, ttl: Ttl) -> Result<Self> {
+        // A disk cache the platform will not name a directory for is a disk
+        // cache that does not run, rather than one guessing at a path.
+        let disk = config
+            .disk_cache
+            .then(|| {
+                config
+                    .cache_dir
+                    .clone()
+                    .map_or_else(DiskStore::discover, |root| Some(DiskStore::at(root)))
+            })
+            .flatten();
+
+        // Bounded once per process, off the request path entirely: a prune
+        // walks the whole directory, and no caller should ever wait for it.
+        if let (Some(store), Ok(handle)) = (disk.clone(), tokio::runtime::Handle::try_current()) {
+            let capacity = config.disk_cache_capacity_bytes;
+            handle.spawn(async move {
+                let outcome = tokio::task::spawn_blocking(move || store.prune(capacity)).await;
+                if let Ok(Ok(removed)) = outcome
+                    && removed > 0
+                {
+                    tracing::debug!(removed_bytes = removed, "pruned the documentation cache");
+                }
+            });
+        }
+
         Ok(Self {
             fetcher: Fetcher::new(&config)?,
             ttl,
@@ -154,13 +193,19 @@ impl Client {
             doc_gates: Gates::new(DOC_GATE_CAPACITY),
             doc_parses: tokio::sync::Semaphore::new(CONCURRENT_DOC_PARSES),
             max_rustdoc_bytes: config.max_rustdoc_bytes,
+            disk,
+            disk_hits: AtomicU64::new(0),
+            disk_writes: AtomicU64::new(0),
         })
     }
 
     /// Cache and traffic counters, for diagnostics.
     #[must_use]
     pub fn stats(&self) -> Stats {
-        self.fetcher.stats()
+        let mut stats = self.fetcher.stats();
+        stats.disk_hits = self.disk_hits.load(Ordering::Relaxed);
+        stats.disk_writes = self.disk_writes.load(Ordering::Relaxed);
+        stats
     }
 
     /// How far the crates.io API pacing queue currently extends.
@@ -289,6 +334,11 @@ impl Client {
     /// the release, and [`Error::BodyTooLarge`] if the document expands past
     /// the configured ceiling.
     pub async fn doc_index(&self, name: &str, version: &str) -> Result<Arc<DocIndex>> {
+        // Before any cache is consulted, so that a request that could never be
+        // made cannot be answered from one either. It also fixes the shape of
+        // the key: both caches are keyed on a name and version that have been
+        // checked, not on whatever a caller passed.
+        let url = docs::rustdoc_url(name, version)?;
         let key: Arc<str> = Arc::from(format!("{name}@{version}"));
         if let Some(hit) = self.doc_indexes.get(&key).await {
             return Ok(hit);
@@ -304,7 +354,18 @@ impl Client {
             return Ok(hit);
         }
 
-        let url = docs::rustdoc_url(name, version)?;
+        // Immutable by construction: docs.rs builds a release's rustdoc JSON
+        // once and never rebuilds it, so an index derived from it is as good
+        // tomorrow as today. That is the whole licence for keeping it.
+        if let Some(store) = &self.disk
+            && let Ok(Some(stored)) = store.load::<docs::StoredIndex>(&key)
+        {
+            let parsed = Arc::new(DocIndex::from_stored(stored));
+            self.disk_hits.fetch_add(1, Ordering::Relaxed);
+            self.doc_indexes.insert(Arc::clone(&key), Arc::clone(&parsed)).await;
+            return Ok(parsed);
+        }
+
         // The body is not retained: its parsed form is roughly ten times its
         // compressed size, and the body cache is bounded by transferred bytes,
         // so keeping it would hold far more memory than that bound describes.
@@ -345,7 +406,24 @@ impl Client {
         })??;
 
         let parsed = Arc::new(parsed);
-        self.doc_indexes.insert(key, Arc::clone(&parsed)).await;
+        self.doc_indexes.insert(Arc::clone(&key), Arc::clone(&parsed)).await;
+
+        // Written behind the answer, never in front of it. Encoding copies the
+        // arenas and compresses them, and no caller should wait for a cache to
+        // be populated with something they have already been given.
+        if let Some(store) = self.disk.clone() {
+            let for_disk = Arc::clone(&parsed);
+            let outcome =
+                tokio::task::spawn_blocking(move || store.store(&key, &for_disk.to_stored())).await;
+            match outcome {
+                Ok(Ok(())) => {
+                    self.disk_writes.fetch_add(1, Ordering::Relaxed);
+                },
+                Ok(Err(err)) => tracing::debug!(%err, "could not cache the documentation index"),
+                Err(err) => tracing::debug!(%err, "the documentation cache writer did not finish"),
+            }
+        }
+
         Ok(parsed)
     }
 

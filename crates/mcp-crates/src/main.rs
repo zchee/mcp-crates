@@ -58,6 +58,24 @@ struct Cli {
     #[arg(long, env = "MCP_CRATES_CACHE_MIB", value_name = "MIB", default_value_t = 128)]
     cache_mib: u64,
 
+    /// Do not keep parsed documentation on disk between runs.
+    ///
+    /// The server is started afresh for every client session, so without a
+    /// disk cache each one re-downloads and re-parses rustdoc JSON that cannot
+    /// have changed since the last.
+    #[arg(long, env = "MCP_CRATES_NO_DISK_CACHE")]
+    no_disk_cache: bool,
+
+    /// Where to keep it, instead of the platform's cache directory.
+    #[arg(long, env = "MCP_CRATES_CACHE_DIR", value_name = "DIR")]
+    cache_dir: Option<std::path::PathBuf>,
+
+    /// Ceiling on the documentation cache, in mebibytes.
+    ///
+    /// Enforced at startup by deleting the least recently written entries.
+    #[arg(long, env = "MCP_CRATES_DISK_CACHE_MIB", value_name = "MIB", default_value_t = 512)]
+    disk_cache_mib: u64,
+
     /// Log filter, in `tracing` `EnvFilter` syntax. Logs are written to stderr,
     /// because stdout carries the protocol.
     #[arg(
@@ -95,6 +113,9 @@ impl Cli {
             Duration::from_millis(self.api_interval_ms.max(POLICY_MIN_API_INTERVAL_MS));
         config.max_queue_wait = Duration::from_secs(self.queue_wait_secs);
         config.cache_capacity_bytes = self.cache_mib.saturating_mul(1024 * 1024);
+        config.disk_cache = !self.no_disk_cache;
+        config.cache_dir.clone_from(&self.cache_dir);
+        config.disk_cache_capacity_bytes = self.disk_cache_mib.saturating_mul(1024 * 1024);
         config
     }
 }
@@ -124,6 +145,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         user_agent = %config.user_agent,
         api_interval_ms = config.api_min_interval.as_millis(),
         cache_mib = cli.cache_mib,
+        disk_cache = config.disk_cache,
+        disk_cache_dir = ?config.cache_dir,
         "starting the crates.io MCP server"
     );
 
@@ -139,6 +162,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         network_requests = stats.network_requests,
         not_modified = stats.not_modified,
         bytes_received = stats.bytes_received,
+        disk_hits = stats.disk_hits,
+        disk_writes = stats.disk_writes,
         "the crates.io MCP server has stopped"
     );
     Ok(())

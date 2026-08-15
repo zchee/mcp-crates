@@ -143,6 +143,10 @@ pub struct Stats {
     pub shed: u64,
     /// Transient failures that were retried.
     pub retries: u64,
+    /// Documentation indexes read back from the disk cache instead of fetched.
+    pub disk_hits: u64,
+    /// Documentation indexes written to the disk cache.
+    pub disk_writes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -166,6 +170,10 @@ impl Counters {
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
             shed: self.shed.load(Ordering::Relaxed),
             retries: self.retries.load(Ordering::Relaxed),
+            // Filled in by the client: the disk cache sits above the fetcher,
+            // which is why it can report requests these two avoided.
+            disk_hits: 0,
+            disk_writes: 0,
         }
     }
 }
