@@ -7,7 +7,7 @@
 //! than passed through.
 
 use crates_io_client::{
-    CrateCategory, CrateSummary, DependencyKind, DocItem, IndexDep, IndexEntry, Sort,
+    CrateCategory, CrateSummary, DependencyKind, DocItem, IndexDep, IndexEntry, Reexport, Sort,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -533,6 +533,32 @@ impl From<&DocItem> for ItemDoc {
     }
 }
 
+/// An item this crate exposes but another crate documents.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ReexportedItem {
+    /// The name this crate exposes the item under.
+    pub name: String,
+    /// The crate that defines and documents it. A crates.io package name is
+    /// usually the same, sometimes with `-` where this has `_`.
+    pub defined_in: String,
+    /// The item's full path inside the crate that defines it, usable as the
+    /// `item` argument once looking that crate up.
+    pub path: String,
+    /// The rustdoc item kind.
+    pub kind: String,
+}
+
+impl From<&Reexport> for ReexportedItem {
+    fn from(reexport: &Reexport) -> Self {
+        Self {
+            name: reexport.name.to_string(),
+            defined_in: reexport.defining_crate.to_string(),
+            path: reexport.path.to_string(),
+            kind: reexport.kind.to_string(),
+        }
+    }
+}
+
 /// Result of `get_crate_documentation`.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct CrateDocumentationResult {
@@ -563,6 +589,11 @@ pub struct CrateDocumentationResult {
     /// exactly one.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub suggestions: Vec<ItemDoc>,
+    /// Where to find the item when this crate only re-exports it. Facade
+    /// crates, whose public API is mostly `pub use` of their own sub-crates,
+    /// document almost nothing themselves.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reexported: Vec<ReexportedItem>,
     /// How many documented items the release has, when its rustdoc JSON was
     /// read.
     #[serde(skip_serializing_if = "Option::is_none")]

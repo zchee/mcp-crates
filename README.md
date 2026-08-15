@@ -136,9 +136,23 @@ Methods from derived trait impls are deliberately left out; including them would
 bury a crate's own API under thousands of `clone`, `fmt` and `eq` entries.
 
 Lookups widen in steps — exact path, then path suffix, then bare name, then
-substring — so `Value::as_str` finds `serde_json::value::Value::as_str` without
-the caller knowing which module it lives in. A query matching several items
-returns them all as suggestions rather than silently picking one.
+re-export, then substring — so `Value::as_str` finds
+`serde_json::value::Value::as_str` without the caller knowing which module it
+lives in. A query matching several items returns them all as suggestions rather
+than silently picking one.
+
+Facade crates need the re-export step. A crate whose public API is mostly
+`pub use` of its own sub-crates documents almost nothing itself: rustdoc
+attributes each re-exported item to the crate that defines it, and `ratatui`
+is left with 16 items of its own against 6805 foreign ones it merely mentions.
+Following the `use` items separates the 125 genuine re-exports from the rest,
+so asking `ratatui` about `Frame` answers with where to look:
+
+```
+"Frame" is not documented by this crate, which only re-exports it from
+ratatui_core; call this tool again for that crate with item
+"ratatui_core::terminal::frame::Frame"
+```
 
 READMEs come back as Markdown rather than the HTML crates.io stores, with images
 and heading anchors dropped: a reader that cannot see a badge gains nothing from

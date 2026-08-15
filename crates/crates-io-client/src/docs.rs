@@ -63,6 +63,27 @@ impl DocItem {
     }
 }
 
+/// An item this crate re-exports from another crate.
+///
+/// A facade crate — one whose public API is mostly `pub use` of its own
+/// sub-crates — documents almost nothing itself. rustdoc records the
+/// re-exported items as belonging to the crate that defines them, and does not
+/// carry their documentation here, so the most useful thing this crate can say
+/// about such an item is where its documentation actually lives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Reexport {
+    /// The name this crate exposes the item under.
+    pub name: Box<str>,
+    /// The crate that defines it, as rustdoc names it. A crates.io package name
+    /// is usually the same, sometimes with `-` where rustdoc has `_`.
+    pub defining_crate: Box<str>,
+    /// The item's full path inside the crate that defines it.
+    pub path: Box<str>,
+    /// The rustdoc item kind.
+    pub kind: Box<str>,
+}
+
 /// The result of looking an item up by path.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
@@ -71,6 +92,9 @@ pub struct Lookup<'a> {
     pub found: Option<&'a DocItem>,
     /// Other items that could have been meant, ordered best first.
     pub suggestions: Vec<&'a DocItem>,
+    /// Matching items this crate only re-exports, whose documentation belongs
+    /// to another crate. Populated only when nothing local matched.
+    pub reexported: Vec<&'a Reexport>,
 }
 
 /// A crate's documentation, indexed by item path.
@@ -80,6 +104,8 @@ pub struct DocIndex {
     format_version: Option<u64>,
     /// Every documented item of the crate itself, ordered by path.
     items: Box<[DocItem]>,
+    /// Items re-exported from other crates, ordered by exposed name.
+    reexports: Box<[Reexport]>,
     truncated: bool,
 }
 
@@ -97,6 +123,14 @@ struct RustdocRoot {
     paths: HashMap<String, PathSummary>,
     #[serde(default)]
     index: HashMap<String, IndexItem>,
+    #[serde(default)]
+    external_crates: HashMap<String, ExternalCrate>,
+}
+
+#[derive(Deserialize)]
+struct ExternalCrate {
+    #[serde(default)]
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -143,6 +177,10 @@ struct ItemBody {
     impls: Vec<u32>,
     /// Whether an impl block implements a trait, as opposed to being inherent.
     is_trait_impl: bool,
+    /// The item a `use` points at.
+    target: Option<u32>,
+    /// The name a `use` exposes its target under.
+    alias: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for ItemBody {
@@ -169,6 +207,8 @@ impl<'de> Visitor<'de> for ItemBodyVisitor {
                 "trait" => {
                     body.is_trait_impl = map.next_value::<Option<IgnoredAny>>()?.is_some();
                 },
+                "id" => body.target = map.next_value()?,
+                "name" => body.alias = map.next_value()?,
                 _ => {
                     map.next_value::<IgnoredAny>()?;
                 },
@@ -265,10 +305,15 @@ impl DocIndex {
         items.sort_by(|left, right| left.path.cmp(&right.path));
         items.dedup_by(|left, right| left.path == right.path);
 
+        let mut reexports = collect_reexports(&root);
+        reexports.sort_by(|left, right| (&left.name, &left.path).cmp(&(&right.name, &right.path)));
+        reexports.dedup_by(|left, right| left.name == right.name && left.path == right.path);
+
         Ok(Self {
             crate_version: root.crate_version,
             format_version: root.format_version,
             items: items.into_boxed_slice(),
+            reexports: reexports.into_boxed_slice(),
             truncated,
         })
     }
@@ -289,6 +334,12 @@ impl DocIndex {
     #[must_use]
     pub fn items(&self) -> &[DocItem] {
         &self.items
+    }
+
+    /// Items this crate re-exports from other crates.
+    #[must_use]
+    pub fn reexports(&self) -> &[Reexport] {
+        &self.reexports
     }
 
     /// How many items are indexed.
@@ -354,7 +405,11 @@ impl DocIndex {
         }
 
         if let Ok(position) = self.items.binary_search_by(|item| (*item.path).cmp(query)) {
-            return Lookup { found: Some(&self.items[position]), suggestions: Vec::new() };
+            return Lookup {
+                found: Some(&self.items[position]),
+                suggestions: Vec::new(),
+                reexported: Vec::new(),
+            };
         }
 
         let suffix = format!("::{query}");
@@ -373,22 +428,82 @@ impl DocIndex {
             return resolved;
         }
 
+        // Checked before the substring pass below, because a re-export match is
+        // exact on the name the crate exposes, while a substring match is a
+        // guess. Asking a facade crate for `Frame` should say where `Frame`
+        // lives, not offer `FrameExt` because the letters appear in it.
+        let reexported = self.reexported_as(query);
+        if !reexported.is_empty() {
+            return Lookup { found: None, suggestions: Vec::new(), reexported };
+        }
+
         let lowered = query.to_ascii_lowercase();
         let fuzzy: Vec<&DocItem> = self
             .items
             .iter()
             .filter(|item| item.path.to_ascii_lowercase().contains(&lowered))
             .collect();
-        Lookup { found: None, suggestions: shortlist(fuzzy) }
+        Lookup { found: None, suggestions: shortlist(fuzzy), reexported: Vec::new() }
     }
+
+    /// Re-exports whose exposed name matches a query.
+    ///
+    /// The query is matched against the name this crate exposes, so both
+    /// `Frame` and `ratatui::Frame` find the same item.
+    fn reexported_as(&self, query: &str) -> Vec<&Reexport> {
+        let wanted = query.rsplit("::").next().unwrap_or(query);
+        let mut matches: Vec<&Reexport> =
+            self.reexports.iter().filter(|item| item.name.eq_ignore_ascii_case(wanted)).collect();
+        matches.truncate(MAX_SUGGESTIONS);
+        matches
+    }
+}
+
+/// Collect the items this crate re-exports from other crates.
+///
+/// A `use` in the index names the item it points at, so following those is what
+/// separates a genuine re-export from the thousands of foreign items the path
+/// table mentions merely because something references them. For `ratatui` that
+/// is the difference between 125 entries and 6805.
+fn collect_reexports(root: &RustdocRoot) -> Vec<Reexport> {
+    root.index
+        .values()
+        .filter_map(|item| {
+            let (kind, body) = item.classify()?;
+            if kind != "use" {
+                return None;
+            }
+            let target = root.paths.get(&body.target?.to_string())?;
+            if target.crate_id == 0 || target.path.is_empty() {
+                return None;
+            }
+            let defining_crate = root
+                .external_crates
+                .get(&target.crate_id.to_string())
+                .map(|external| external.name.as_str())
+                .unwrap_or("an unnamed crate");
+            Some(Reexport {
+                name: body.alias.clone().or_else(|| item.name.clone())?.into_boxed_str(),
+                defining_crate: Box::from(defining_crate),
+                path: target.path.join("::").into_boxed_str(),
+                kind: target.kind.clone().into_boxed_str(),
+            })
+        })
+        .collect()
 }
 
 /// Turn a set of candidates into a resolution, if there is anything to resolve.
 fn resolve<'a>(candidates: &[&'a DocItem]) -> Option<Lookup<'a>> {
     match candidates {
         [] => None,
-        [only] => Some(Lookup { found: Some(only), suggestions: Vec::new() }),
-        many => Some(Lookup { found: None, suggestions: shortlist(many.to_vec()) }),
+        [only] => {
+            Some(Lookup { found: Some(only), suggestions: Vec::new(), reexported: Vec::new() })
+        },
+        many => Some(Lookup {
+            found: None,
+            suggestions: shortlist(many.to_vec()),
+            reexported: Vec::new(),
+        }),
     }
 }
 
@@ -548,8 +663,15 @@ mod tests {
             "0:5":  {"crate_id": 0, "path": ["demo", "de", "Error"], "kind": "enum"},
             "0:6":  {"crate_id": 0, "path": ["demo", "ser", "Error"], "kind": "enum"},
             "0:7":  {"crate_id": 0, "path": ["demo", "value", "Value"], "kind": "struct"},
+            "0:98": {"crate_id": 0, "path": ["demo", "FrameExt"], "kind": "trait"},
             "0:99": {"crate_id": 0, "path": ["demo", "shout"], "kind": "macro"},
-            "1:0":  {"crate_id": 1, "path": ["other", "Thing"], "kind": "struct"}
+            "1:0":  {"crate_id": 1, "path": ["other", "Thing"], "kind": "struct"},
+            "70":   {"crate_id": 1, "path": ["demo_core", "frame", "Frame"], "kind": "struct"},
+            "71":   {"crate_id": 2, "path": ["unrelated", "Hidden"], "kind": "struct"}
+        },
+        "external_crates": {
+            "1": {"name": "demo_core"},
+            "2": {"name": "unrelated"}
         },
         "index": {
             "0:0": {"docs": "The demo crate.", "inner": {"module": {"items": []}}},
@@ -567,7 +689,8 @@ mod tests {
             "31": {"inner": {"impl": {"trait": {"path": "Clone"}, "items": [50]}}},
             "40": {"name": "as_str", "docs": "Borrow as a string.", "inner": {"function": {}}},
             "41": {"name": "is_null", "docs": "Whether this is null.", "inner": {"function": {}}},
-            "50": {"name": "clone", "docs": "Clones.", "inner": {"function": {}}}
+            "50": {"name": "clone", "docs": "Clones.", "inner": {"function": {}}},
+            "60": {"inner": {"use": {"source": "demo_core::frame::Frame", "name": "Frame", "id": 70, "is_glob": false}}}
         }
     }"#;
 
@@ -708,6 +831,72 @@ mod tests {
     fn leading_path_separators_are_ignored() {
         let index = index();
         assert!(index.lookup("::demo::Legacy").found.is_some());
+    }
+
+    #[test]
+    fn a_reexported_item_is_reported_against_the_crate_that_defines_it() {
+        // A facade crate documents almost nothing itself, so "not found here"
+        // is the wrong answer: the item exists, elsewhere.
+        let index = index();
+        let result = index.lookup("Frame");
+
+        assert!(result.found.is_none(), "the crate does not document Frame itself");
+        assert!(result.suggestions.is_empty());
+
+        let [reexport] = result.reexported.as_slice() else {
+            panic!("expected exactly one re-export, got {:?}", result.reexported);
+        };
+        assert_eq!(reexport.name.as_ref(), "Frame");
+        assert_eq!(reexport.defining_crate.as_ref(), "demo_core");
+        assert_eq!(reexport.path.as_ref(), "demo_core::frame::Frame");
+        assert_eq!(reexport.kind.as_ref(), "struct");
+    }
+
+    #[test]
+    fn a_reexport_is_found_through_the_name_this_crate_exposes() {
+        let index = index();
+        // The caller writes the path they would use, not the defining one.
+        assert_eq!(index.lookup("demo::Frame").reexported.len(), 1);
+        assert_eq!(index.lookup("frame").reexported.len(), 1, "matching ignores case");
+    }
+
+    #[test]
+    fn only_genuine_reexports_are_recorded_not_every_foreign_item_mentioned() {
+        // The path table names foreign items merely because something refers to
+        // them; without following the `use` items, a lookup would suggest
+        // unrelated internals of unrelated dependencies.
+        let index = index();
+        assert_eq!(index.reexports().len(), 1);
+        assert!(index.lookup("Hidden").reexported.is_empty());
+    }
+
+    #[test]
+    fn an_exact_reexport_beats_a_substring_match_on_an_unrelated_local_item() {
+        // The crate documents `FrameExt`, whose path contains the letters of
+        // "Frame", and re-exports something actually called `Frame`. The
+        // re-export is what was asked for.
+        let index = index();
+        assert!(
+            paths(&index).contains(&"demo::FrameExt"),
+            "the fixture needs a local substring match for this to discriminate"
+        );
+
+        let result = index.lookup("Frame");
+        assert!(
+            result.suggestions.is_empty(),
+            "a substring guess should not outrank an exact re-export: {:?}",
+            result.suggestions
+        );
+        assert_eq!(result.reexported.len(), 1);
+        assert_eq!(result.reexported[0].path.as_ref(), "demo_core::frame::Frame");
+    }
+
+    #[test]
+    fn a_local_item_wins_over_a_reexport_of_the_same_name() {
+        let index = index();
+        let found = index.lookup("demo::Legacy").found.expect("resolves locally");
+        assert_eq!(found.path.as_ref(), "demo::Legacy");
+        assert!(index.lookup("demo::Legacy").reexported.is_empty());
     }
 
     #[test]

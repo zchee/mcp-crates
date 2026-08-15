@@ -22,7 +22,7 @@ use crate::{
         CrateVersionsResult, DEFAULT_SEARCH_LIMIT, DEFAULT_VERSION_LIMIT, DepKind, DependencyEntry,
         GetCrateDependenciesArgs, GetCrateDocumentationArgs, GetCrateInfoArgs,
         GetCrateVersionsArgs, ItemDoc, LatestReleaseSummary, MAX_SEARCH_LIMIT, MAX_VERSION_LIMIT,
-        SearchCratesArgs, SearchCratesResult, VersionEntry,
+        ReexportedItem, SearchCratesArgs, SearchCratesResult, VersionEntry,
     },
 };
 
@@ -336,6 +336,7 @@ impl CratesServer {
 
         let mut item = None;
         let mut suggestions: Vec<ItemDoc> = Vec::new();
+        let mut reexported: Vec<ReexportedItem> = Vec::new();
         let mut documented_items = None;
 
         let docs_rs_built = match docs_result {
@@ -350,8 +351,15 @@ impl CratesServer {
                 let lookup = doc_index.lookup(query);
                 item = lookup.found.map(ItemDoc::from);
                 suggestions = lookup.suggestions.iter().copied().map(ItemDoc::from).collect();
+                reexported = lookup.reexported.iter().copied().map(ReexportedItem::from).collect();
                 if item.is_none() {
-                    notes.push(if suggestions.is_empty() {
+                    notes.push(if let Some(first) = reexported.first() {
+                        format!(
+                            "{:?} is not documented by this crate, which only re-exports it from \
+                             {}; call this tool again for that crate with item {:?}",
+                            first.name, first.defined_in, first.path
+                        )
+                    } else if suggestions.is_empty() {
                         format!("no item matching {query:?} is documented in this release")
                     } else {
                         format!(
@@ -386,6 +394,7 @@ impl CratesServer {
             readme,
             item,
             suggestions,
+            reexported,
             documented_items,
             note: (!notes.is_empty()).then(|| notes.join("; ")),
         }))

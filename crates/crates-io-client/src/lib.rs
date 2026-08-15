@@ -74,7 +74,7 @@ pub use crate::{
         SearchParams, SearchResponse, Sort,
     },
     config::{Config, Ttl},
-    docs::{BuildStatus, DocIndex, DocItem, Lookup},
+    docs::{BuildStatus, DocIndex, DocItem, Lookup, Reexport},
     error::{Category, Error, Result},
     fetch::{Origin, Stats},
     index::{CrateIndex, DependencyKind, IndexDep, IndexEntry, validate_name},
