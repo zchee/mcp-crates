@@ -28,8 +28,7 @@ use crate::{
 };
 
 /// Guidance handed to the model alongside the tool list.
-const INSTRUCTIONS: &str =
-    "\
+const INSTRUCTIONS: &str = "\
 Read-only access to the crates.io registry: search for Rust crates and inspect their metadata, \
      versions, dependencies and documentation.
 
