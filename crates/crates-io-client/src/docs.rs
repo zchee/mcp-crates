@@ -492,6 +492,58 @@ impl DocIndex {
         Lookup { found: None, suggestions: shortlist(fuzzy), reexported: Vec::new() }
     }
 
+    /// The resolution ladder written as four linear passes, kept as the oracle
+    /// the equivalence suite measures the real [`DocIndex::lookup`] against.
+    ///
+    /// This is not a description of the intended behaviour — it *is* the
+    /// behaviour, copied from the implementation that shipped before the
+    /// precomputed indexes existed. Any query on which the two disagree is a
+    /// behaviour change, whether or not anyone meant it.
+    #[cfg(test)]
+    fn lookup_linear(&self, query: &str) -> Lookup<'_> {
+        let query = query.trim().trim_start_matches("::");
+        if query.is_empty() {
+            return Lookup::default();
+        }
+
+        if let Ok(position) = self.items.binary_search_by(|item| (*item.path).cmp(query)) {
+            return Lookup {
+                found: Some(&self.items[position]),
+                suggestions: Vec::new(),
+                reexported: Vec::new(),
+            };
+        }
+
+        let suffix = format!("::{query}");
+        let by_suffix: Vec<&DocItem> =
+            self.items.iter().filter(|item| item.path.ends_with(&suffix)).collect();
+        if let Some(resolved) = resolve(&by_suffix) {
+            return resolved;
+        }
+
+        let by_name: Vec<&DocItem> = self
+            .items
+            .iter()
+            .filter(|item| item.short_name().eq_ignore_ascii_case(query))
+            .collect();
+        if let Some(resolved) = resolve(&by_name) {
+            return resolved;
+        }
+
+        let reexported = self.reexported_as(query);
+        if !reexported.is_empty() {
+            return Lookup { found: None, suggestions: Vec::new(), reexported };
+        }
+
+        let lowered = query.to_ascii_lowercase();
+        let fuzzy: Vec<&DocItem> = self
+            .items
+            .iter()
+            .filter(|item| item.path.to_ascii_lowercase().contains(&lowered))
+            .collect();
+        Lookup { found: None, suggestions: shortlist(fuzzy), reexported: Vec::new() }
+    }
+
     /// Re-exports whose exposed name matches a query.
     ///
     /// The query is matched against the name this crate exposes, so both
@@ -1157,6 +1209,155 @@ mod tests {
             let first = DocIndex::parse(case.name, &case.body).expect("parses");
             let second = DocIndex::parse(case.name, &case.body).expect("parses");
             assert_identical(label, &first, &second);
+        }
+    }
+
+    /// The corpus the equivalence suite runs over: the parity corpus, parsed.
+    fn equivalence_corpus() -> Vec<(&'static str, DocIndex)> {
+        parity_corpus()
+            .into_iter()
+            .map(|(label, case)| {
+                (label, DocIndex::parse(case.name, &case.body).expect("the corpus parses"))
+            })
+            .collect()
+    }
+
+    /// The ten query shapes the resolution ladder distinguishes, named so that a
+    /// failure says which step disagreed rather than only which string did.
+    ///
+    /// Written against the inline fixture, which is the only corpus entry whose
+    /// contents are visible here — including the one case that pins a
+    /// precedence rule rather than a match: `Frame` is re-exported and
+    /// `FrameExt` is a local substring match, and the re-export has to win.
+    fn named_cases() -> [(&'static str, &'static str); 12] {
+        [
+            ("exact path", "demo::de::Deserializer"),
+            ("leading separator", "::demo::Legacy"),
+            ("unique suffix", "de::Deserializer"),
+            ("ambiguous suffix", "Error"),
+            ("bare name, case-insensitive", "deserializer"),
+            ("ambiguous bare name", "error"),
+            ("re-export beats a local substring", "Frame"),
+            ("re-export through the exposed path", "demo::Frame"),
+            ("fuzzy substring hit", "serial"),
+            ("fuzzy miss", "zzqxnotpresent"),
+            ("empty", ""),
+            ("whitespace only", "   "),
+        ]
+    }
+
+    /// Queries derived from an index's own contents.
+    ///
+    /// Hand-written cases only cover what the author remembered; these cover
+    /// what the corpus actually holds. Each item contributes its full path, the
+    /// same path with a leading separator, its final segment in three cases, a
+    /// two-segment suffix, and an interior substring — which between them reach
+    /// every step of the ladder, ambiguous and unique alike.
+    fn derived_queries(index: &DocIndex, stride: usize) -> Vec<String> {
+        let mut queries = vec![
+            String::new(),
+            "   ".to_owned(),
+            "::".to_owned(),
+            "zzqxnotpresent".to_owned(),
+            "::::".to_owned(),
+        ];
+        for item in index.items().iter().step_by(stride.max(1)) {
+            let path = item.path.as_ref();
+            let short = item.short_name();
+            queries.push(path.to_owned());
+            queries.push(format!("::{path}"));
+            queries.push(short.to_owned());
+            queries.push(short.to_ascii_lowercase());
+            queries.push(short.to_ascii_uppercase());
+
+            let segments: Vec<&str> = path.split("::").collect();
+            if segments.len() >= 2 {
+                queries.push(segments[segments.len() - 2..].join("::"));
+            }
+            if short.len() > 3 {
+                queries.push(short[1..short.len() - 1].to_ascii_lowercase());
+            }
+        }
+        // Every re-export by the name the crate exposes, which is the only way
+        // to reach the re-export step.
+        for reexport in index.reexports() {
+            queries.push(reexport.name.to_string());
+            queries.push(reexport.name.to_ascii_lowercase());
+        }
+        queries
+    }
+
+    /// Assert two resolutions are the same answer, position by position.
+    ///
+    /// `DocItem` and `Reexport` both derive `PartialEq`, so this compares every
+    /// field of every entry, and `Vec` comparison is positional, so it compares
+    /// the ordering too — which is the part a candidate-list rewrite is most
+    /// likely to get subtly wrong.
+    fn assert_same_lookup(context: &str, fast: &Lookup<'_>, reference: &Lookup<'_>) {
+        assert_eq!(fast.found, reference.found, "{context}: found");
+        assert_eq!(fast.suggestions, reference.suggestions, "{context}: suggestions");
+        assert_eq!(fast.reexported, reference.reexported, "{context}: reexported");
+    }
+
+    #[test]
+    fn lookup_matches_the_linear_reference_over_the_whole_corpus() {
+        let mut compared = 0_usize;
+        for (label, index) in equivalence_corpus() {
+            // The generated document is two orders of magnitude larger than the
+            // rest, and the reference is four linear passes with an allocation
+            // per item per query, so it is sampled rather than swept.
+            let stride = if index.len() > 10_000 { 4_099 } else { 3 };
+
+            let queries: Vec<String> = named_cases()
+                .iter()
+                .map(|(_, query)| (*query).to_owned())
+                .chain(derived_queries(&index, stride))
+                .collect();
+
+            for query in &queries {
+                assert_same_lookup(
+                    &format!("{label}: query {query:?}"),
+                    &index.lookup(query),
+                    &index.lookup_linear(query),
+                );
+                compared += 1;
+            }
+        }
+        // Pinned rather than bounded below: the corpus and the derivation rules
+        // are both deterministic, so this number moving means one of them
+        // changed, and a battery that quietly shrank would keep passing.
+        assert_eq!(compared, 756, "the query battery changed size");
+    }
+
+    #[test]
+    fn every_named_query_shape_reaches_the_step_it_is_named_for() {
+        // A battery that silently stopped exercising a step would still pass the
+        // equivalence test above, because both implementations would agree on
+        // the step it did reach. These assertions pin what each case is for.
+        let index = index();
+        let resolved = |query: &str| index.lookup(query).found.map(|item| item.path.to_string());
+
+        assert_eq!(resolved("demo::de::Deserializer").as_deref(), Some("demo::de::Deserializer"));
+        assert_eq!(resolved("::demo::Legacy").as_deref(), Some("demo::Legacy"));
+        assert_eq!(resolved("de::Deserializer").as_deref(), Some("demo::de::Deserializer"));
+        assert_eq!(resolved("deserializer").as_deref(), Some("demo::de::Deserializer"));
+
+        let ambiguous = index.lookup("Error");
+        assert!(ambiguous.found.is_none() && ambiguous.suggestions.len() > 1, "ambiguous suffix");
+        let ambiguous_name = index.lookup("error");
+        assert!(ambiguous_name.found.is_none() && ambiguous_name.suggestions.len() > 1);
+
+        let reexported = index.lookup("Frame");
+        assert!(reexported.suggestions.is_empty(), "a re-export outranks a substring guess");
+        assert_eq!(reexported.reexported.len(), 1);
+        assert_eq!(index.lookup("demo::Frame").reexported.len(), 1);
+
+        let fuzzy = index.lookup("serial");
+        assert!(fuzzy.found.is_none() && !fuzzy.suggestions.is_empty(), "fuzzy hit");
+
+        for empty in ["zzqxnotpresent", "", "   ", "::"] {
+            let miss = index.lookup(empty);
+            assert!(miss.found.is_none() && miss.suggestions.is_empty(), "{empty:?}");
         }
     }
 
