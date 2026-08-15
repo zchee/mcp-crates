@@ -335,11 +335,36 @@ impl DocIndex {
 
         // A stable order makes lookups deterministic despite the hash maps
         // above, and lets exact matches use a binary search.
-        items.sort_by(|left, right| left.path.cmp(&right.path));
+        //
+        // Ordering on more than the path is what makes the deduplication below
+        // deterministic. Two ids can describe the same path — an item reachable
+        // through more than one route, or a name a method shares with the type
+        // it hangs off — and ordering on the path alone would leave the
+        // survivor to be whichever the hash map happened to yield first. The
+        // entry carrying documentation wins, because documentation is the thing
+        // this index exists to serve; the remaining keys only have to be a total
+        // order, so that the answer is the same on every run.
+        items.sort_unstable_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| right.docs.is_some().cmp(&left.docs.is_some()))
+                .then_with(|| left.kind.cmp(&right.kind))
+                .then_with(|| left.docs.cmp(&right.docs))
+                .then_with(|| left.deprecated.cmp(&right.deprecated))
+        });
         items.dedup_by(|left, right| left.path == right.path);
 
         let mut reexports = collect_reexports(&root);
-        reexports.sort_by(|left, right| (&left.name, &left.path).cmp(&(&right.name, &right.path)));
+        // Same reasoning: `(name, path)` is what the deduplication compares, so
+        // the ordering has to break ties past it or the survivor is arbitrary.
+        reexports.sort_unstable_by(|left, right| {
+            (&left.name, &left.path, &left.defining_crate, &left.kind).cmp(&(
+                &right.name,
+                &right.path,
+                &right.defining_crate,
+                &right.kind,
+            ))
+        });
         reexports.dedup_by(|left, right| left.name == right.name && left.path == right.path);
 
         Ok(Self {
@@ -1358,6 +1383,61 @@ mod tests {
         for empty in ["zzqxnotpresent", "", "   ", "::"] {
             let miss = index.lookup(empty);
             assert!(miss.found.is_none() && miss.suggestions.is_empty(), "{empty:?}");
+        }
+    }
+
+    /// Two ids describing the same path, one documented and one not, plus a
+    /// pair of re-exports that agree on `(name, path)` and differ past it.
+    const COLLIDING: &str = r#"{
+        "paths": {
+            "1":  {"crate_id": 0, "path": ["demo", "Thing"], "kind": "struct"},
+            "2":  {"crate_id": 0, "path": ["demo", "Thing"], "kind": "enum"},
+            "3":  {"crate_id": 0, "path": ["demo"], "kind": "module"},
+            "90": {"crate_id": 1, "path": ["dep", "Shared"], "kind": "struct"},
+            "91": {"crate_id": 2, "path": ["dep", "Shared"], "kind": "struct"}
+        },
+        "external_crates": {"1": {"name": "alpha"}, "2": {"name": "beta"}},
+        "index": {
+            "2":  {"docs": "The documented one."},
+            "80": {"inner": {"use": {"name": "Shared", "id": 90}}},
+            "81": {"inner": {"use": {"name": "Shared", "id": 91}}}
+        }
+    }"#;
+
+    #[test]
+    fn a_path_reached_by_two_ids_resolves_to_the_documented_one_every_time() {
+        // Items are collected by iterating a hash map, so before the ordering
+        // broke ties past the path, which of two same-path entries survived
+        // deduplication was decided by the hash seed — a different answer from
+        // the same bytes across runs of the same binary.
+        let first = DocIndex::parse("demo", COLLIDING.as_bytes()).expect("parses");
+
+        let thing = first.lookup("demo::Thing").found.expect("resolves");
+        assert_eq!(thing.docs.as_deref(), Some("The documented one."));
+        assert_eq!(thing.kind.as_ref(), "enum", "the documented entry brings its own kind");
+
+        // Repeated because the failure this guards against is probabilistic:
+        // one parse could agree with the rule by luck.
+        for attempt in 1..32 {
+            let again = DocIndex::parse("demo", COLLIDING.as_bytes()).expect("parses");
+            assert_eq!(again, first, "parse {attempt} disagreed with parse 0");
+        }
+    }
+
+    #[test]
+    fn two_reexports_agreeing_on_name_and_path_resolve_the_same_way_every_time() {
+        let first = DocIndex::parse("demo", COLLIDING.as_bytes()).expect("parses");
+        let [reexport] = first.reexports() else {
+            panic!("expected one survivor, got {:?}", first.reexports());
+        };
+        // `alpha` and `beta` both expose `Shared` at `dep::Shared`; the
+        // deduplication compares only `(name, path)`, so the ordering has to
+        // decide, and it decides on the defining crate.
+        assert_eq!(reexport.defining_crate.as_ref(), "alpha");
+
+        for attempt in 1..32 {
+            let again = DocIndex::parse("demo", COLLIDING.as_bytes()).expect("parses");
+            assert_eq!(again, first, "parse {attempt} disagreed with parse 0");
         }
     }
 
