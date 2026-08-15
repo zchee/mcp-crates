@@ -11,12 +11,27 @@
 //! ceiling — but the ceiling is exactly where the linear scans cost the most, so
 //! it is the case worth measuring.
 //!
-//! Run with `cargo bench -p crates-io-client`, never concurrently with another
-//! build: a benchmark sharing the machine with a linker is measuring the linker.
+//! # Running
+//!
+//! ```sh
+//! cargo bench -p crates-io-client --bench hot_paths
+//! ```
+//!
+//! Never concurrently with another build: a benchmark sharing the machine with
+//! a linker is measuring the linker. Comparisons across a change are made
+//! against a stored baseline rather than by copying numbers between documents,
+//! which is what keeps a claimed improvement checkable:
+//!
+//! ```sh
+//! cargo bench -p crates-io-client -- --save-baseline before
+//! # ... make the change ...
+//! cargo bench -p crates-io-client -- --baseline before
+//! ```
 
-use std::sync::LazyLock;
+use std::{sync::LazyLock, time::Duration};
 
 use crates_io_client::{CrateIndex, DocIndex, Lookup, docs, readme, synthetic};
+use criterion::{Criterion, measurement::WallTime};
 
 /// The allocator the server binary installs.
 ///
@@ -29,14 +44,36 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Expansion ceiling handed to `decompress_rustdoc`, far above any fixture.
 const DECOMPRESS_LIMIT: usize = 64 * 1024 * 1024;
 
+/// Long enough for criterion to fit its default 100 samples around the slowest
+/// benchmarks here, which are tens of milliseconds each. Left at the default,
+/// criterion would warn on every run and shrink the sample it reasons from.
+const SLOW_MEASUREMENT: Duration = Duration::from_secs(12);
+
 fn main() {
     verify_fixtures();
-    divan::main();
+
+    let mut criterion = Criterion::default().configure_from_args();
+    decompress(&mut criterion);
+    parse(&mut criterion);
+    lookup_regex(&mut criterion);
+    lookup_synthetic_50k(&mut criterion);
+    documents(&mut criterion);
+    criterion.final_summary();
 }
 
 /// The item the captured-index lookups resolve to. Its bare name and its
 /// two-segment suffix are both unique in `regex`'s documentation.
 const REGEX_TARGET: &str = "regex::pattern::RegexSearcher";
+
+/// The generated item the lookup benchmarks resolve to. Both its bare name and
+/// its two-segment suffix are unique in the document, so each lookup terminates
+/// at the step the benchmark is named for.
+const SYNTHETIC_TARGET: u32 = 25_000;
+
+/// A query no fixture contains, which is what makes it the expensive one: it
+/// falls through the exact, suffix, name and re-export passes, and then scans
+/// and lowercases every path in the index.
+const MISS: &str = "zzqxnotpresent";
 
 /// Check that every benchmark measures what its name says, before measuring it.
 ///
@@ -120,16 +157,6 @@ static SYNTHETIC_INDEX: LazyLock<DocIndex> = LazyLock::new(|| {
     DocIndex::parse("synth", SYNTHETIC.as_bytes()).expect("the generator is valid")
 });
 
-/// The generated item the lookup benchmarks resolve to. Both its bare name and
-/// its two-segment suffix are unique in the document, so each lookup terminates
-/// at the step the benchmark is named for.
-const SYNTHETIC_TARGET: u32 = 25_000;
-
-/// A query no fixture contains, which is what makes it the expensive one: it
-/// falls through the exact, suffix, name and re-export passes, and then scans
-/// and lowercases every path in the index.
-const MISS: &str = "zzqxnotpresent";
-
 /// Queries built once, so that the timed region holds a lookup and nothing else.
 static SYNTHETIC_EXACT: LazyLock<String> = LazyLock::new(|| {
     format!("synth::m{}::Item{SYNTHETIC_TARGET}", SYNTHETIC_TARGET / synthetic::MODULE_SIZE)
@@ -140,109 +167,78 @@ static SYNTHETIC_SUFFIX: LazyLock<String> = LazyLock::new(|| {
 static SYNTHETIC_NAME: LazyLock<String> = LazyLock::new(|| format!("item{SYNTHETIC_TARGET}"));
 
 /// Expanding the document docs.rs transfers.
-#[divan::bench_group]
-mod decompress {
-    use super::{DECOMPRESS_LIMIT, REGEX, SEMVER, docs};
-
-    #[divan::bench]
-    fn regex_fv55() -> Vec<u8> {
-        docs::decompress_rustdoc("regex", REGEX.compressed, DECOMPRESS_LIMIT).expect("decompresses")
-    }
-
-    #[divan::bench]
-    fn semver_fv60() -> Vec<u8> {
-        docs::decompress_rustdoc("semver", SEMVER.compressed, DECOMPRESS_LIMIT)
-            .expect("decompresses")
-    }
+fn decompress(criterion: &mut Criterion<WallTime>) {
+    let mut group = criterion.benchmark_group("decompress");
+    group.bench_function("regex_fv55", |bencher| {
+        bencher.iter(|| {
+            docs::decompress_rustdoc("regex", REGEX.compressed, DECOMPRESS_LIMIT)
+                .expect("decompresses")
+        });
+    });
+    group.bench_function("semver_fv60", |bencher| {
+        bencher.iter(|| {
+            docs::decompress_rustdoc("semver", SEMVER.compressed, DECOMPRESS_LIMIT)
+                .expect("decompresses")
+        });
+    });
+    group.finish();
 }
 
 /// Turning an expanded rustdoc document into an index: the dominant cost of the
 /// whole client.
-#[divan::bench_group]
-mod parse {
-    use super::{DocIndex, REGEX, SEMVER, SYNTHETIC};
-
-    #[divan::bench]
-    fn regex_fv55() -> DocIndex {
-        REGEX.parse()
-    }
-
-    #[divan::bench]
-    fn semver_fv60() -> DocIndex {
-        SEMVER.parse()
-    }
-
-    #[divan::bench]
-    fn synthetic_50k() -> DocIndex {
-        DocIndex::parse("synth", SYNTHETIC.as_bytes()).expect("parses")
-    }
+fn parse(criterion: &mut Criterion<WallTime>) {
+    let mut group = criterion.benchmark_group("parse");
+    group.measurement_time(SLOW_MEASUREMENT);
+    group.bench_function("regex_fv55", |bencher| bencher.iter(|| REGEX.parse()));
+    group.bench_function("semver_fv60", |bencher| bencher.iter(|| SEMVER.parse()));
+    group.bench_function("synthetic_50k", |bencher| {
+        bencher.iter(|| DocIndex::parse("synth", SYNTHETIC.as_bytes()).expect("parses"));
+    });
+    group.finish();
 }
 
 /// Resolving a query against a captured index of 209 items.
-#[divan::bench_group]
-mod lookup_regex {
-    use super::{Lookup, MISS, REGEX_INDEX};
-
-    #[divan::bench]
-    fn exact_path() -> Lookup<'static> {
-        REGEX_INDEX.lookup("regex::builders::bytes::RegexBuilder::build")
-    }
-
-    #[divan::bench]
-    fn unique_suffix() -> Lookup<'static> {
-        REGEX_INDEX.lookup("pattern::RegexSearcher")
-    }
-
-    #[divan::bench]
-    fn bare_name() -> Lookup<'static> {
-        REGEX_INDEX.lookup("regexsearcher")
-    }
-
-    #[divan::bench]
-    fn fuzzy_miss() -> Lookup<'static> {
-        REGEX_INDEX.lookup(MISS)
-    }
+fn lookup_regex(criterion: &mut Criterion<WallTime>) {
+    let mut group = criterion.benchmark_group("lookup_regex");
+    group.bench_function("exact_path", |bencher| {
+        bencher.iter(|| REGEX_INDEX.lookup("regex::builders::bytes::RegexBuilder::build"));
+    });
+    group.bench_function("unique_suffix", |bencher| {
+        bencher.iter(|| REGEX_INDEX.lookup("pattern::RegexSearcher"));
+    });
+    group.bench_function("bare_name", |bencher| {
+        bencher.iter(|| REGEX_INDEX.lookup("regexsearcher"))
+    });
+    group.bench_function("fuzzy_miss", |bencher| bencher.iter(|| REGEX_INDEX.lookup(MISS)));
+    group.finish();
 }
 
 /// The same four queries against an index at the 50 000-item ceiling, which is
 /// where the linear scans and the per-item lowercasing actually hurt.
-#[divan::bench_group]
-mod lookup_synthetic_50k {
-    use super::{Lookup, MISS, SYNTHETIC_EXACT, SYNTHETIC_INDEX, SYNTHETIC_NAME, SYNTHETIC_SUFFIX};
-
-    #[divan::bench]
-    fn exact_path() -> Lookup<'static> {
-        SYNTHETIC_INDEX.lookup(&SYNTHETIC_EXACT)
-    }
-
-    #[divan::bench]
-    fn unique_suffix() -> Lookup<'static> {
-        SYNTHETIC_INDEX.lookup(&SYNTHETIC_SUFFIX)
-    }
-
-    #[divan::bench]
-    fn bare_name() -> Lookup<'static> {
-        SYNTHETIC_INDEX.lookup(&SYNTHETIC_NAME)
-    }
-
-    #[divan::bench]
-    fn fuzzy_miss() -> Lookup<'static> {
-        SYNTHETIC_INDEX.lookup(MISS)
-    }
+fn lookup_synthetic_50k(criterion: &mut Criterion<WallTime>) {
+    let mut group = criterion.benchmark_group("lookup_synthetic_50k");
+    group.measurement_time(SLOW_MEASUREMENT);
+    group.bench_function("exact_path", |bencher| {
+        bencher.iter(|| SYNTHETIC_INDEX.lookup(&SYNTHETIC_EXACT));
+    });
+    group.bench_function("unique_suffix", |bencher| {
+        bencher.iter(|| SYNTHETIC_INDEX.lookup(&SYNTHETIC_SUFFIX));
+    });
+    group.bench_function("bare_name", |bencher| {
+        bencher.iter(|| SYNTHETIC_INDEX.lookup(&SYNTHETIC_NAME));
+    });
+    group.bench_function("fuzzy_miss", |bencher| bencher.iter(|| SYNTHETIC_INDEX.lookup(MISS)));
+    group.finish();
 }
 
 /// The two parse paths that are not rustdoc JSON.
-#[divan::bench_group]
-mod documents {
-    use super::{CrateIndex, SERDE_INDEX, TOKIO_README, readme};
-
-    #[divan::bench]
-    fn crate_index_parse() -> CrateIndex {
-        CrateIndex::parse("serde", SERDE_INDEX).expect("the committed fixture parses")
-    }
-
-    #[divan::bench]
-    fn readme_to_markdown() -> String {
-        readme::to_markdown(TOKIO_README)
-    }
+fn documents(criterion: &mut Criterion<WallTime>) {
+    let mut group = criterion.benchmark_group("documents");
+    group.bench_function("crate_index_parse", |bencher| {
+        bencher.iter(|| CrateIndex::parse("serde", SERDE_INDEX).expect("the fixture parses"));
+    });
+    group.bench_function("readme_to_markdown", |bencher| {
+        bencher.iter(|| readme::to_markdown(TOKIO_README));
+    });
+    group.finish();
 }

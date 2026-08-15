@@ -13,7 +13,7 @@ crates-io-client = { version = "0.1.0", path = "crates/crates-io-client" }
 
 bytes = "1.12"
 clap = { version = "4.6", features = ["derive", "env", "wrap_help"] }
-divan = "0.1"
+criterion = { version = "0.8", features = ["cargo_bench_support", "html_reports"] }
 foldhash = "0.2"
 htmd = "0.5"
 http = "1.5"
