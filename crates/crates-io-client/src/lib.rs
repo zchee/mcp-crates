@@ -55,14 +55,22 @@
 mod api;
 mod cache;
 mod config;
-mod docs;
 mod error;
 mod fetch;
 mod gate;
 mod index;
 mod pacer;
-mod readme;
 mod version;
+
+// Reachable so that `benches/hot_paths.rs`, which links this crate as an
+// ordinary dependency, can time the two functions the rest of the API only
+// reaches through a network fetch: `docs::decompress_rustdoc` and
+// `readme::to_markdown`. Hidden because the supported surface is still the
+// re-exports below, which is where the documentation lives.
+#[doc(hidden)]
+pub mod docs;
+#[doc(hidden)]
+pub mod readme;
 
 use std::{sync::Arc, time::Duration};
 

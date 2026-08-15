@@ -13,6 +13,7 @@ crates-io-client = { version = "0.1.0", path = "crates/crates-io-client" }
 
 bytes = "1.12"
 clap = { version = "4.6", features = ["derive", "env", "wrap_help"] }
+divan = "0.1"
 htmd = "0.5"
 http = "1.5"
 moka = { version = "0.12", features = ["future"] }
