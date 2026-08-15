@@ -49,6 +49,10 @@ pub struct Config {
     pub max_body_bytes: usize,
 
     /// Largest rustdoc JSON document the client will decompress.
+    ///
+    /// Parsing holds roughly twice the expanded size again, and several
+    /// documents can be in flight at once, so this is the main lever on how
+    /// much memory documentation lookups can occupy.
     pub max_rustdoc_bytes: usize,
 
     /// How many times a transient failure is retried before giving up.
@@ -70,7 +74,7 @@ impl Config {
             connect_timeout: Duration::from_secs(10),
             cache_capacity_bytes: 128 * 1024 * 1024,
             max_body_bytes: 16 * 1024 * 1024,
-            max_rustdoc_bytes: 96 * 1024 * 1024,
+            max_rustdoc_bytes: 48 * 1024 * 1024,
             max_retries: 3,
         }
     }

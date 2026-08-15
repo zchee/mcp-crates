@@ -42,7 +42,85 @@ pub fn to_markdown(html: &str) -> String {
 
     let markdown = converter.convert(html).unwrap_or_else(|_| strip_tags(html));
     let without_empty_links = remove_empty_links(&markdown);
-    collapse_blank_lines(without_empty_links.trim())
+    let inert = neutralize_unsafe_links(&without_empty_links);
+    collapse_blank_lines(inert.trim())
+}
+
+/// Schemes a link destination may use and still be presented as a link.
+const SAFE_SCHEMES: [&str; 3] = ["http", "https", "mailto"];
+
+/// Find the `)` that closes a link destination starting at `from`.
+///
+/// Parentheses nest: `javascript:alert(1)` and plenty of ordinary URLs contain
+/// their own, and stopping at the first `)` would cut a destination in half and
+/// leave its tail behind as text.
+fn destination_end(text: &str, from: usize) -> Option<usize> {
+    let mut depth = 1_usize;
+    for (offset, character) in text[from..].char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(from + offset);
+                }
+            },
+            _ => {},
+        }
+    }
+    None
+}
+
+/// Whether a link destination is one worth presenting as a link.
+///
+/// A destination with no scheme is relative or an anchor and carries nothing.
+fn is_safe_destination(destination: &str) -> bool {
+    let destination = destination.trim();
+    let Some(colon) = destination.find(':') else {
+        return true;
+    };
+    let scheme = &destination[..colon];
+    // Anything before a path, query or fragment separator is not a scheme.
+    if scheme.contains(['/', '?', '#']) {
+        return true;
+    }
+    SAFE_SCHEMES.iter().any(|safe| scheme.eq_ignore_ascii_case(safe))
+}
+
+/// Demote links whose destination uses an unexpected scheme to plain text.
+///
+/// crates.io sanitizes the HTML it renders, so this is a second line rather
+/// than the only one. It costs a scan and removes the question of whether a
+/// `javascript:` destination could reach a consumer that renders what it is
+/// given.
+fn neutralize_unsafe_links(markdown: &str) -> String {
+    let mut output = String::with_capacity(markdown.len());
+
+    for line in markdown.lines() {
+        let mut rest = line;
+        while let Some(open) = rest.find('[') {
+            let Some(separator) = rest[open..].find("](").map(|offset| open + offset) else {
+                break;
+            };
+            let Some(close) = destination_end(rest, separator + 2) else {
+                break;
+            };
+
+            output.push_str(&rest[..open]);
+            if is_safe_destination(&rest[separator + 2..close]) {
+                output.push_str(&rest[open..=close]);
+            } else {
+                // Keep what the reader was meant to see, drop where it pointed.
+                output.push_str(&rest[open + 1..separator]);
+            }
+            rest = &rest[close + 1..];
+        }
+        output.push_str(rest);
+        output.push('\n');
+    }
+
+    output.truncate(output.trim_end().len());
+    output
 }
 
 /// Cut a document to a character budget, appending a marker so a consumer can
@@ -102,11 +180,11 @@ fn remove_empty_links(markdown: &str) -> String {
 
         let mut rest = line;
         while let Some(start) = rest.find("[](") {
-            let Some(end) = rest[start + 3..].find(')') else {
+            let Some(end) = destination_end(rest, start + 3) else {
                 break;
             };
             output.push_str(&rest[..start]);
-            rest = &rest[start + 3 + end + 1..];
+            rest = &rest[end + 1..];
         }
         output.push_str(rest);
         output.push('\n');
@@ -258,6 +336,47 @@ mod tests {
     fn bracket_sequences_inside_code_fences_are_left_alone() {
         let source = "text\n```rust\nlet v: Vec<u8> = [](); // odd but code\n```\nmore";
         assert_eq!(remove_empty_links(source), source);
+    }
+
+    #[test]
+    fn a_destination_containing_parentheses_is_consumed_whole() {
+        // Both link passes have to agree on where a destination ends, or one
+        // leaves the tail of it behind as visible text.
+        assert_eq!(remove_empty_links("a [](https://x.example/a(b)c) b"), "a  b");
+        assert_eq!(neutralize_unsafe_links("[t](javascript:f(1)) tail"), "t tail");
+        assert_eq!(destination_end("(a(b)c) rest", 1), Some(6));
+        assert_eq!(destination_end("unterminated", 0), None);
+    }
+
+    #[test]
+    fn link_destinations_are_limited_to_schemes_worth_following() {
+        for safe in ["https://x.example", "http://x.example", "mailto:a@b.example"] {
+            assert!(is_safe_destination(safe), "{safe}");
+        }
+        for safe in ["#anchor", "./relative", "path/to:thing", "", "/abs"] {
+            assert!(is_safe_destination(safe), "{safe} has no scheme");
+        }
+        for unsafe_destination in ["javascript:alert(1)", "JavaScript:x", "data:text/html,x"] {
+            assert!(!is_safe_destination(unsafe_destination), "{unsafe_destination}");
+        }
+    }
+
+    #[test]
+    fn an_unsafe_link_keeps_its_text_and_loses_its_destination() {
+        assert_eq!(
+            neutralize_unsafe_links("see [the docs](javascript:alert(1)) now"),
+            "see the docs now"
+        );
+        assert_eq!(
+            neutralize_unsafe_links("see [the docs](https://x.example)"),
+            "see [the docs](https://x.example)"
+        );
+    }
+
+    #[test]
+    fn a_line_with_several_links_neutralizes_only_the_unsafe_ones() {
+        let line = "[a](https://x.example) and [b](data:text/html,x) and [c](#anchor)";
+        assert_eq!(neutralize_unsafe_links(line), "[a](https://x.example) and b and [c](#anchor)");
     }
 
     #[test]

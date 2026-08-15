@@ -92,6 +92,15 @@ const DOC_INDEX_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
 /// How many crate versions may have a documentation gate at once.
 const DOC_GATE_CAPACITY: u64 = 256;
 
+/// How many rustdoc documents may be expanded and parsed at the same time.
+///
+/// The gate above deduplicates identical requests but says nothing about
+/// distinct ones. Expanding a document holds the compressed body, the expanded
+/// bytes and the parsed structure at once, so without a ceiling a handful of
+/// concurrent lookups across different crates add up to more memory than the
+/// machine has.
+const CONCURRENT_DOC_PARSES: usize = 2;
+
 /// A client for crates.io, its sparse index, and docs.rs.
 ///
 /// Cheap to clone behind an [`Arc`]; all caching and pacing state is shared, so
@@ -102,6 +111,7 @@ pub struct Client {
     ttl: Ttl,
     doc_indexes: Cache<Arc<str>, Arc<DocIndex>>,
     doc_gates: Gates,
+    doc_parses: tokio::sync::Semaphore,
     max_rustdoc_bytes: usize,
 }
 
@@ -131,6 +141,7 @@ impl Client {
                 .time_to_live(ttl.rustdoc)
                 .build(),
             doc_gates: Gates::new(DOC_GATE_CAPACITY),
+            doc_parses: tokio::sync::Semaphore::new(CONCURRENT_DOC_PARSES),
             max_rustdoc_bytes: config.max_rustdoc_bytes,
         })
     }
@@ -297,12 +308,32 @@ impl Client {
                 )
             })?;
 
-        let limit = self.max_rustdoc_bytes;
-        let parsed = body.derive(|bytes| {
-            let expanded = docs::decompress_rustdoc(name, bytes, limit)?;
-            DocIndex::parse(name, &expanded)
+        // Expanding and parsing is where both the time and the memory go, and
+        // it is CPU-bound, so it is admitted a couple at a time and run off the
+        // async runtime rather than occupying a reactor thread.
+        let _permit = self.doc_parses.acquire().await.map_err(|_| {
+            Error::InvalidArgument("the documentation parser has been shut down".to_owned())
         })?;
 
+        let limit = self.max_rustdoc_bytes;
+        let owner = name.to_owned();
+        let compressed = body.body.clone();
+        drop(body);
+
+        let parsed = tokio::task::spawn_blocking(move || {
+            let expanded = docs::decompress_rustdoc(&owner, &compressed, limit)?;
+            // Dead once expanded; releasing it keeps one fewer copy alive
+            // across the parse, which is the peak.
+            drop(compressed);
+            DocIndex::parse(&owner, &expanded)
+        })
+        .await
+        .map_err(|err| Error::Decode {
+            url: docs::rustdoc_url(name, version).unwrap_or_default(),
+            message: format!("the documentation parser did not finish: {err}"),
+        })??;
+
+        let parsed = Arc::new(parsed);
         self.doc_indexes.insert(key, Arc::clone(&parsed)).await;
         Ok(parsed)
     }

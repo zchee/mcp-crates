@@ -190,7 +190,11 @@ impl CrateIndex {
             message: format!("the index document is not valid UTF-8: {err}"),
         })?;
 
-        let mut entries: Vec<IndexEntry> = Vec::with_capacity(text.lines().count());
+        // Capped rather than trusted: the line count is attacker-influenced, and
+        // one entry is a few hundred bytes, so a document of nothing but
+        // newlines would ask for gigabytes up front and abort the process.
+        // Growth past the cap costs a few reallocations and nothing else.
+        let mut entries: Vec<IndexEntry> = Vec::with_capacity(text.lines().count().min(4096));
         for (number, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() {
@@ -447,6 +451,19 @@ mod tests {
         let legacy = r#"{"name":"old","vers":"0.1.0","deps":[{"name":"libc","req":"*","features":[],"optional":false,"default_features":true,"target":null}],"cksum":"ee","features":{},"yanked":false}"#;
         let index = CrateIndex::parse("old", legacy.as_bytes()).expect("parses");
         assert_eq!(index.entries()[0].deps[0].kind, DependencyKind::Normal);
+    }
+
+    #[test]
+    fn a_document_of_blank_lines_does_not_reserve_memory_for_each_one() {
+        // The reservation is derived from the line count, which the response
+        // controls. Without a cap this would ask the allocator for gigabytes.
+        let mut document = "\n".repeat(2_000_000);
+        document.push_str(
+            r#"{"name":"demo","vers":"1.0.0","deps":[],"cksum":"aa","features":{},"yanked":false}"#,
+        );
+
+        let index = CrateIndex::parse("demo", document.as_bytes()).expect("parses");
+        assert_eq!(index.len(), 1);
     }
 
     #[test]
