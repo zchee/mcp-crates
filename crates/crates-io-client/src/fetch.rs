@@ -400,7 +400,7 @@ impl Fetcher {
             // from the CDN, so sending its `ETag` to the API would revalidate
             // nothing and the CDN hop would re-transfer the whole body.
             if let Some(cached) = validators
-                && current.as_str() == cached.final_url.as_ref()
+                && validator_applies(&current, cached)
             {
                 if let Some(etag) = &cached.etag {
                     request = request.header(IF_NONE_MATCH, if_none_match(etag));
@@ -433,18 +433,7 @@ impl Fetcher {
                         reason: format!("more than {MAX_REDIRECTS} redirects"),
                     });
                 }
-                let location = response
-                    .headers()
-                    .get(LOCATION)
-                    .and_then(|value| value.to_str().ok())
-                    .ok_or_else(|| Error::UnsupportedUrl {
-                        url: current.to_string(),
-                        reason: format!("HTTP {status} without a usable Location header"),
-                    })?;
-                current = current.join(location).map_err(|err| Error::UnsupportedUrl {
-                    url: current.to_string(),
-                    reason: format!("unusable Location {location:?}: {err}"),
-                })?;
+                current = follow_redirect(&current, response.headers(), status.as_u16())?;
                 continue;
             }
 
@@ -515,6 +504,35 @@ impl Fetcher {
         }
         Ok(buffer)
     }
+}
+
+/// Resolve the next hop of a redirect.
+///
+/// The `Location` is resolved against the URL that issued it, so a relative
+/// target lands where the origin meant. The result is not trusted further than
+/// that: [`classify`] checks it before it is requested, on this hop as on every
+/// other.
+fn follow_redirect(current: &Url, headers: &HeaderMap, status: u16) -> Result<Url> {
+    let location =
+        headers.get(LOCATION).and_then(|value| value.to_str().ok()).ok_or_else(|| {
+            Error::UnsupportedUrl {
+                url: current.to_string(),
+                reason: format!("HTTP {status} without a usable Location header"),
+            }
+        })?;
+    current.join(location).map_err(|err| Error::UnsupportedUrl {
+        url: current.to_string(),
+        reason: format!("unusable Location {location:?}: {err}"),
+    })
+}
+
+/// Whether a cached entry's validator applies to the URL about to be requested.
+///
+/// A validator means something only to the URL that issued it, which is where
+/// the cached body came from rather than where the request began. They differ
+/// whenever a redirect is involved.
+fn validator_applies(current: &Url, cached: &CachedBody) -> bool {
+    current.as_str() == cached.final_url.as_ref()
 }
 
 /// Build an `If-None-Match` value from a cached entity tag.
@@ -814,6 +832,71 @@ mod tests {
         assert_eq!(effective_ttl(configured, &forbidden), Duration::ZERO);
 
         assert_eq!(effective_ttl(configured, &HeaderMap::new()), configured);
+    }
+
+    fn cached_from(final_url: &str, etag: &str) -> CachedBody {
+        CachedBody::new(
+            bytes::Bytes::from_static(b"body"),
+            200,
+            Some(Box::from(etag)),
+            None,
+            Box::from(final_url),
+            Duration::from_secs(60),
+        )
+    }
+
+    #[test]
+    fn a_validator_applies_only_to_the_url_that_issued_it() {
+        // A README is asked of the API and served by the CDN, so its entity tag
+        // belongs to the CDN URL. Sending it to the API would revalidate
+        // nothing and the CDN hop would re-transfer the whole body.
+        let cached =
+            cached_from("https://static.crates.io/readmes/anyhow/anyhow-1.0.0.html", r#""abc""#);
+
+        let asked = Url::parse("https://crates.io/api/v1/crates/anyhow/1.0.0/readme").expect("url");
+        assert!(!validator_applies(&asked, &cached), "the first hop did not serve this body");
+
+        let served =
+            Url::parse("https://static.crates.io/readmes/anyhow/anyhow-1.0.0.html").expect("url");
+        assert!(validator_applies(&served, &cached));
+    }
+
+    #[test]
+    fn a_validator_applies_at_the_first_hop_when_nothing_redirected() {
+        let url = "https://index.crates.io/se/rd/serde";
+        let cached = cached_from(url, r#""abc""#);
+        assert!(validator_applies(&Url::parse(url).expect("url"), &cached));
+    }
+
+    #[test]
+    fn a_relative_location_resolves_against_the_url_that_issued_it() {
+        let current =
+            Url::parse("https://crates.io/api/v1/crates/serde/1.0.0/readme").expect("url");
+        let mut headers = HeaderMap::new();
+        headers.insert(LOCATION, "/readmes/serde.html".parse().expect("header"));
+
+        let next = follow_redirect(&current, &headers, 302).expect("resolves");
+        assert_eq!(next.as_str(), "https://crates.io/readmes/serde.html");
+    }
+
+    #[test]
+    fn a_redirect_off_the_allowed_hosts_is_refused_on_the_hop_that_would_follow_it() {
+        let current =
+            Url::parse("https://crates.io/api/v1/crates/serde/1.0.0/readme").expect("url");
+        let mut headers = HeaderMap::new();
+        headers.insert(LOCATION, "https://evil.invalid/steal".parse().expect("header"));
+
+        // Resolution itself is permissive; the host check is what refuses it,
+        // and it runs on every hop rather than only the first.
+        let next = follow_redirect(&current, &headers, 302).expect("resolves");
+        assert!(matches!(classify(&next), Err(Error::UnsupportedUrl { .. })));
+    }
+
+    #[test]
+    fn a_redirect_without_a_location_is_an_error_rather_than_a_silent_stop() {
+        let current = Url::parse("https://crates.io/x").expect("url");
+        let refused = follow_redirect(&current, &HeaderMap::new(), 302);
+        assert!(matches!(refused, Err(Error::UnsupportedUrl { .. })), "{refused:?}");
     }
 
     #[test]
