@@ -18,6 +18,36 @@ follows.
 | `serde.index.json` | `https://index.crates.io/se/rd/serde` | sparse-index document, 316 versions |
 | `tokio-1.44.2.readme.html` | `https://crates.io/api/v1/crates/tokio/1.44.2/readme` | rendered README, as `static.crates.io` serves it |
 
+## Digests
+
+A benchmark figure is only comparable to another one if both were taken over the
+same bytes, and a parity result only means something if the two deserializers
+were handed the same document. Both claims are made across commits — the
+optimization record compares a measurement at `49f7569` against one at HEAD — so
+the identity of these files is pinned here rather than assumed.
+
+| File | Bytes | SHA-256 |
+|---|---|---|
+| `regex-1.11.1.rustdoc.json.zst` | 122 204 | `d09232dde79d8ec3e244e8239076a2168ccf1d6a176e8a918cdd4023803d17c2` |
+| `semver-1.0.28.rustdoc.json.zst` | 48 435 | `b25a4ceb9896f1a9713db5a3d30a7473ae3c809cd4d2416fe414915ae44ed08e` |
+| `serde.index.json` | 164 874 | `9eb6e78eab279f168b5787e4eb801765e1d5a2b40c50789e12166a616d73bbc5` |
+| `tokio-1.44.2.readme.html` | 12 333 | `dac81e2088bff9621f34848f9a5fe146cc710a8a7464bbb24212bb8b685071cf` |
+
+```sh
+shasum -a 256 crates/crates-io-client/fixtures/*.zst \
+              crates/crates-io-client/fixtures/serde.index.json \
+              crates/crates-io-client/fixtures/tokio-1.44.2.readme.html
+```
+
+These files lived at `benches/fixtures/` until `b499047` moved them here, when
+the parity suite began needing them too. The move was a relocation and nothing
+else: the digests above match the ones under the old path, which is what makes a
+benchmark taken before it comparable to one taken after.
+
+Replacing a fixture means replacing a baseline. Anything measured against the old
+bytes stops being a comparison at that moment, so a replacement belongs in its
+own commit, with the digests here updated in the same one.
+
 ## The two rustdoc documents
 
 They are a pair on purpose. rustdoc's JSON schema is versioned and changes
