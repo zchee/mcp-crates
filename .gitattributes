@@ -2,3 +2,10 @@
 #  https://github.com/github-linguist/linguist/blob/main/docs/overrides.md
 
 * text=auto eol=lf
+
+# A benchmark fixture is a byte-exact capture of what a server transferred, and
+# a zstd frame that git decided to treat as text would come back out a different
+# document. `text=auto` classifies these correctly today only because they
+# happen to carry a NUL byte inside git's detection window; saying so outright
+# does not leave that to chance.
+*.zst binary

@@ -1,0 +1,189 @@
+<h1><a href="#tokio" id="user-content-tokio" rel="nofollow noopener noreferrer"></a>Tokio</h1>
+<p>A runtime for writing reliable, asynchronous, and slim applications with
+the Rust programming language. It is:</p>
+<ul>
+<li>
+<p><strong>Fast</strong>: Tokio's zero-cost abstractions give you bare-metal
+performance.</p>
+</li>
+<li>
+<p><strong>Reliable</strong>: Tokio leverages Rust's ownership, type system, and
+concurrency model to reduce bugs and ensure thread safety.</p>
+</li>
+<li>
+<p><strong>Scalable</strong>: Tokio has a minimal footprint, and handles backpressure
+and cancellation naturally.</p>
+</li>
+</ul>
+<p><a href="https://crates.io/crates/tokio" rel="nofollow noopener noreferrer"><img src="https://img.shields.io/crates/v/tokio.svg" alt="Crates.io"></a>
+<a href="https://github.com/tokio-rs/tokio/blob/master/LICENSE" rel="nofollow noopener noreferrer"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT licensed"></a>
+<a href="https://github.com/tokio-rs/tokio/actions?query=workflow%3ACI+branch%3Amaster" rel="nofollow noopener noreferrer"><img src="https://github.com/tokio-rs/tokio/workflows/CI/badge.svg" alt="Build Status"></a>
+<a href="https://discord.gg/tokio" rel="nofollow noopener noreferrer"><img src="https://img.shields.io/discord/500028886025895936.svg?logo=discord&amp;style=flat-square" alt="Discord chat"></a></p>
+<p><a href="https://tokio.rs" rel="nofollow noopener noreferrer">Website</a> |
+<a href="https://tokio.rs/tokio/tutorial" rel="nofollow noopener noreferrer">Guides</a> |
+<a href="https://docs.rs/tokio/latest/tokio" rel="nofollow noopener noreferrer">API Docs</a> |
+<a href="https://discord.gg/tokio" rel="nofollow noopener noreferrer">Chat</a></p>
+<h2><a href="#overview" id="user-content-overview" rel="nofollow noopener noreferrer"></a>Overview</h2>
+<p>Tokio is an event-driven, non-blocking I/O platform for writing
+asynchronous applications with the Rust programming language. At a high
+level, it provides a few major components:</p>
+<ul>
+<li>A multithreaded, work-stealing based task <a href="https://docs.rs/tokio/latest/tokio/runtime/index.html" rel="nofollow noopener noreferrer">scheduler</a>.</li>
+<li>A reactor backed by the operating system's event queue (epoll, kqueue,
+IOCP, etc...).</li>
+<li>Asynchronous <a href="https://docs.rs/tokio/latest/tokio/net/index.html" rel="nofollow noopener noreferrer">TCP and UDP</a> sockets.</li>
+</ul>
+<p>These components provide the runtime components necessary for building
+an asynchronous application.</p>
+<h2><a href="#example" id="user-content-example" rel="nofollow noopener noreferrer"></a>Example</h2>
+<p>A basic TCP echo server with Tokio.</p>
+<p>Make sure you activated the full features of the tokio crate on Cargo.toml:</p>
+<pre><code class="language-toml">[dependencies]
+tokio = { version = "1.44.2", features = ["full"] }
+</code></pre>
+<p>Then, on your main.rs:</p>
+<pre><code class="language-rust">use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[tokio::main]
+async fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let listener = TcpListener::bind("127.0.0.1:8080").await?;
+
+    loop {
+        let (mut socket, _) = listener.accept().await?;
+
+        tokio::spawn(async move {
+            let mut buf = [0; 1024];
+
+            // In a loop, read data from the socket and write the data back.
+            loop {
+                let n = match socket.read(&amp;mut buf).await {
+                    // socket closed
+                    Ok(0) =&gt; return,
+                    Ok(n) =&gt; n,
+                    Err(e) =&gt; {
+                        eprintln!("failed to read from socket; err = {:?}", e);
+                        return;
+                    }
+                };
+
+                // Write the data back
+                if let Err(e) = socket.write_all(&amp;buf[0..n]).await {
+                    eprintln!("failed to write to socket; err = {:?}", e);
+                    return;
+                }
+            }
+        });
+    }
+}
+</code></pre>
+<p>More examples can be found <a href="https://github.com/tokio-rs/tokio/tree/master/examples" rel="nofollow noopener noreferrer">here</a>. For a larger "real world" example, see the
+<a href="https://github.com/tokio-rs/mini-redis/" rel="nofollow noopener noreferrer">mini-redis</a> repository.</p>
+<p>To see a list of the available features flags that can be enabled, check our
+<a href="https://docs.rs/tokio/#feature-flags" rel="nofollow noopener noreferrer">docs</a>.</p>
+<h2><a href="#getting-help" id="user-content-getting-help" rel="nofollow noopener noreferrer"></a>Getting Help</h2>
+<p>First, see if the answer to your question can be found in the <a href="https://tokio.rs/tokio/tutorial" rel="nofollow noopener noreferrer">Guides</a> or the
+<a href="https://docs.rs/tokio/latest/tokio" rel="nofollow noopener noreferrer">API documentation</a>. If the answer is not there, there is an active community in
+the <a href="https://discord.gg/tokio" rel="nofollow noopener noreferrer">Tokio Discord server</a>. We would be happy to try to answer your
+question. You can also ask your question on <a href="https://github.com/tokio-rs/tokio/discussions" rel="nofollow noopener noreferrer">the discussions page</a>.</p>
+<h2><a href="#contributing" id="user-content-contributing" rel="nofollow noopener noreferrer"></a>Contributing</h2>
+<p>:balloon: Thanks for your help improving the project! We are so happy to have
+you! We have a <a href="https://github.com/tokio-rs/tokio/blob/master/CONTRIBUTING.md" rel="nofollow noopener noreferrer">contributing guide</a> to help you get involved in the Tokio
+project.</p>
+<h2><a href="#related-projects" id="user-content-related-projects" rel="nofollow noopener noreferrer"></a>Related Projects</h2>
+<p>In addition to the crates in this repository, the Tokio project also maintains
+several other libraries, including:</p>
+<ul>
+<li>
+<p><a href="https://github.com/tokio-rs/axum" rel="nofollow noopener noreferrer"><code>axum</code></a>: A web application framework that focuses on ergonomics and modularity.</p>
+</li>
+<li>
+<p><a href="https://github.com/hyperium/hyper" rel="nofollow noopener noreferrer"><code>hyper</code></a>: A fast and correct HTTP/1.1 and HTTP/2 implementation for Rust.</p>
+</li>
+<li>
+<p><a href="https://github.com/hyperium/tonic" rel="nofollow noopener noreferrer"><code>tonic</code></a>: A gRPC over HTTP/2 implementation focused on high performance, interoperability, and flexibility.</p>
+</li>
+<li>
+<p><a href="https://github.com/seanmonstar/warp" rel="nofollow noopener noreferrer"><code>warp</code></a>: A super-easy, composable, web server framework for warp speeds.</p>
+</li>
+<li>
+<p><a href="https://github.com/tower-rs/tower" rel="nofollow noopener noreferrer"><code>tower</code></a>: A library of modular and reusable components for building robust networking clients and servers.</p>
+</li>
+<li>
+<p><a href="https://github.com/tokio-rs/tracing" rel="nofollow noopener noreferrer"><code>tracing</code></a> (formerly <code>tokio-trace</code>): A framework for application-level tracing and async-aware diagnostics.</p>
+</li>
+<li>
+<p><a href="https://github.com/tokio-rs/mio" rel="nofollow noopener noreferrer"><code>mio</code></a>: A low-level, cross-platform abstraction over OS I/O APIs that powers <code>tokio</code>.</p>
+</li>
+<li>
+<p><a href="https://github.com/tokio-rs/bytes" rel="nofollow noopener noreferrer"><code>bytes</code></a>: Utilities for working with bytes, including efficient byte buffers.</p>
+</li>
+<li>
+<p><a href="https://github.com/tokio-rs/loom" rel="nofollow noopener noreferrer"><code>loom</code></a>: A testing tool for concurrent Rust code.</p>
+</li>
+</ul>
+<h2><a href="#changelog" id="user-content-changelog" rel="nofollow noopener noreferrer"></a>Changelog</h2>
+<p>The Tokio repository contains multiple crates. Each crate has its own changelog.</p>
+<ul>
+<li><code>tokio</code> - <a href="https://github.com/tokio-rs/tokio/blob/master/tokio/CHANGELOG.md" rel="nofollow noopener noreferrer">view changelog</a></li>
+<li><code>tokio-util</code> - <a href="https://github.com/tokio-rs/tokio/blob/master/tokio-util/CHANGELOG.md" rel="nofollow noopener noreferrer">view changelog</a></li>
+<li><code>tokio-stream</code> - <a href="https://github.com/tokio-rs/tokio/blob/master/tokio-stream/CHANGELOG.md" rel="nofollow noopener noreferrer">view changelog</a></li>
+<li><code>tokio-macros</code> - <a href="https://github.com/tokio-rs/tokio/blob/master/tokio-macros/CHANGELOG.md" rel="nofollow noopener noreferrer">view changelog</a></li>
+<li><code>tokio-test</code> - <a href="https://github.com/tokio-rs/tokio/blob/master/tokio-test/CHANGELOG.md" rel="nofollow noopener noreferrer">view changelog</a></li>
+</ul>
+<h2><a href="#supported-rust-versions" id="user-content-supported-rust-versions" rel="nofollow noopener noreferrer"></a>Supported Rust Versions</h2>
+
+<p>Tokio will keep a rolling MSRV (minimum supported rust version) policy of <strong>at
+least</strong> 6 months. When increasing the MSRV, the new Rust version must have been
+released at least six months ago. The current MSRV is 1.70.</p>
+<p>Note that the MSRV is not increased automatically, and only as part of a minor
+release. The MSRV history for past minor releases can be found below:</p>
+<ul>
+<li>1.39 to now  - Rust 1.70</li>
+<li>1.30 to 1.38 - Rust 1.63</li>
+<li>1.27 to 1.29 - Rust 1.56</li>
+<li>1.17 to 1.26 - Rust 1.49</li>
+<li>1.15 to 1.16 - Rust 1.46</li>
+<li>1.0 to 1.14 - Rust 1.45</li>
+</ul>
+<p>Note that although we try to avoid the situation where a dependency transitively
+increases the MSRV of Tokio, we do not guarantee that this does not happen.
+However, every minor release will have some set of versions of dependencies that
+works with the MSRV of that minor release.</p>
+<h2><a href="#release-schedule" id="user-content-release-schedule" rel="nofollow noopener noreferrer"></a>Release schedule</h2>
+<p>Tokio doesn't follow a fixed release schedule, but we typically make one minor
+release each month. We make patch releases for bugfixes as necessary.</p>
+<h2><a href="#bug-patching-policy" id="user-content-bug-patching-policy" rel="nofollow noopener noreferrer"></a>Bug patching policy</h2>
+<p>For the purposes of making patch releases with bugfixes, we have designated
+certain minor releases as LTS (long term support) releases. Whenever a bug
+warrants a patch release with a fix for the bug, it will be backported and
+released as a new patch release for each LTS minor version. Our current LTS
+releases are:</p>
+<ul>
+<li><code>1.38.x</code> - LTS release until July 2025. (MSRV 1.63)</li>
+<li><code>1.43.x</code> - LTS release until March 2026. (MSRV 1.70)</li>
+</ul>
+<p>Each LTS release will continue to receive backported fixes for at least a year.
+If you wish to use a fixed minor release in your project, we recommend that you
+use an LTS release.</p>
+<p>To use a fixed minor version, you can specify the version with a tilde. For
+example, to specify that you wish to use the newest <code>1.32.x</code> patch release, you
+can use the following dependency specification:</p>
+<pre><code class="">tokio = { version = "~1.38", features = [...] }
+</code></pre>
+<h3><a href="#previous-lts-releases" id="user-content-previous-lts-releases" rel="nofollow noopener noreferrer"></a>Previous LTS releases</h3>
+<ul>
+<li><code>1.8.x</code> - LTS release until February 2022.</li>
+<li><code>1.14.x</code> - LTS release until June 2022.</li>
+<li><code>1.18.x</code> - LTS release until June 2023.</li>
+<li><code>1.20.x</code> - LTS release until September 2023.</li>
+<li><code>1.25.x</code> - LTS release until March 2024.</li>
+<li><code>1.32.x</code> - LTS release until September 2024.</li>
+<li><code>1.36.x</code> - LTS release until March 2025.</li>
+</ul>
+<h2><a href="#license" id="user-content-license" rel="nofollow noopener noreferrer"></a>License</h2>
+<p>This project is licensed under the <a href="https://github.com/tokio-rs/tokio/blob/master/LICENSE" rel="nofollow noopener noreferrer">MIT license</a>.</p>
+<h3><a href="#contribution" id="user-content-contribution" rel="nofollow noopener noreferrer"></a>Contribution</h3>
+<p>Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in Tokio by you, shall be licensed as MIT, without any additional
+terms or conditions.</p>
