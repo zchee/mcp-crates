@@ -17,21 +17,14 @@
 //! cargo bench -p crates-io-client --bench hot_paths
 //! ```
 //!
-//! Never concurrently with another build: a benchmark sharing the machine with
-//! a linker is measuring the linker. Comparisons across a change are made
-//! against a stored baseline rather than by copying numbers between documents,
-//! which is what keeps a claimed improvement checkable:
-//!
-//! ```sh
-//! cargo bench -p crates-io-client -- --save-baseline before
-//! # ... make the change ...
-//! cargo bench -p crates-io-client -- --baseline before
-//! ```
+//! Never concurrently with another build, and never alongside anything else:
+//! a benchmark sharing the machine with a linker is measuring the linker. The
+//! medians this prints are the numbers the optimization record is kept in, so a
+//! run taken on a busy machine is worse than no run at all.
 
-use std::{sync::LazyLock, time::Duration};
+use std::sync::LazyLock;
 
 use crates_io_client::{CrateIndex, DocIndex, Lookup, disk::Store, docs, readme, synthetic};
-use criterion::{Criterion, measurement::WallTime};
 
 /// The allocator the server binary installs.
 ///
@@ -44,22 +37,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Expansion ceiling handed to `decompress_rustdoc`, far above any fixture.
 const DECOMPRESS_LIMIT: usize = 64 * 1024 * 1024;
 
-/// Long enough for criterion to fit its default 100 samples around the slowest
-/// benchmarks here, which are tens of milliseconds each. Left at the default,
-/// criterion would warn on every run and shrink the sample it reasons from.
-const SLOW_MEASUREMENT: Duration = Duration::from_secs(12);
-
 fn main() {
     verify_fixtures();
-
-    let mut criterion = Criterion::default().configure_from_args();
-    decompress(&mut criterion);
-    parse(&mut criterion);
-    lookup_regex(&mut criterion);
-    lookup_synthetic_50k(&mut criterion);
-    documents(&mut criterion);
-    disk_cache(&mut criterion);
-    criterion.final_summary();
+    divan::main();
 }
 
 /// The item the captured-index lookups resolve to. Its bare name and its
@@ -167,119 +147,153 @@ static SYNTHETIC_SUFFIX: LazyLock<String> = LazyLock::new(|| {
 });
 static SYNTHETIC_NAME: LazyLock<String> = LazyLock::new(|| format!("item{SYNTHETIC_TARGET}"));
 
+/// A cache directory seeded with both indexes, for the group below.
+static CACHE: LazyLock<Store> = LazyLock::new(|| {
+    let root = std::env::temp_dir().join(format!("mcp-crates-bench-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let store = Store::at(&root);
+    store.store("regex@1.11.1", &REGEX_INDEX.to_stored()).expect("stores");
+    store.store("synth@0.1.0", &SYNTHETIC_INDEX.to_stored()).expect("stores");
+    store
+});
+
 /// Expanding the document docs.rs transfers.
-fn decompress(criterion: &mut Criterion<WallTime>) {
-    let mut group = criterion.benchmark_group("decompress");
-    group.bench_function("regex_fv55", |bencher| {
-        bencher.iter(|| {
-            docs::decompress_rustdoc("regex", REGEX.compressed, DECOMPRESS_LIMIT)
-                .expect("decompresses")
-        });
-    });
-    group.bench_function("semver_fv60", |bencher| {
-        bencher.iter(|| {
-            docs::decompress_rustdoc("semver", SEMVER.compressed, DECOMPRESS_LIMIT)
-                .expect("decompresses")
-        });
-    });
-    group.finish();
+#[divan::bench_group]
+mod decompress {
+    use super::{DECOMPRESS_LIMIT, REGEX, SEMVER, docs};
+
+    #[divan::bench]
+    fn regex_fv55() -> Vec<u8> {
+        docs::decompress_rustdoc("regex", REGEX.compressed, DECOMPRESS_LIMIT).expect("decompresses")
+    }
+
+    #[divan::bench]
+    fn semver_fv60() -> Vec<u8> {
+        docs::decompress_rustdoc("semver", SEMVER.compressed, DECOMPRESS_LIMIT)
+            .expect("decompresses")
+    }
 }
 
 /// Turning an expanded rustdoc document into an index: the dominant cost of the
 /// whole client.
-fn parse(criterion: &mut Criterion<WallTime>) {
-    let mut group = criterion.benchmark_group("parse");
-    group.measurement_time(SLOW_MEASUREMENT);
-    group.bench_function("regex_fv55", |bencher| bencher.iter(|| REGEX.parse()));
-    group.bench_function("semver_fv60", |bencher| bencher.iter(|| SEMVER.parse()));
-    group.bench_function("synthetic_50k", |bencher| {
-        bencher.iter(|| DocIndex::parse("synth", SYNTHETIC.as_bytes()).expect("parses"));
-    });
-    group.finish();
+#[divan::bench_group]
+mod parse {
+    use super::{DocIndex, REGEX, SEMVER, SYNTHETIC};
+
+    #[divan::bench]
+    fn regex_fv55() -> DocIndex {
+        REGEX.parse()
+    }
+
+    #[divan::bench]
+    fn semver_fv60() -> DocIndex {
+        SEMVER.parse()
+    }
+
+    #[divan::bench]
+    fn synthetic_50k() -> DocIndex {
+        DocIndex::parse("synth", SYNTHETIC.as_bytes()).expect("parses")
+    }
 }
 
 /// Resolving a query against a captured index of 209 items.
-fn lookup_regex(criterion: &mut Criterion<WallTime>) {
-    let mut group = criterion.benchmark_group("lookup_regex");
-    group.bench_function("exact_path", |bencher| {
-        bencher.iter(|| REGEX_INDEX.lookup("regex::builders::bytes::RegexBuilder::build"));
-    });
-    group.bench_function("unique_suffix", |bencher| {
-        bencher.iter(|| REGEX_INDEX.lookup("pattern::RegexSearcher"));
-    });
-    group.bench_function("bare_name", |bencher| {
-        bencher.iter(|| REGEX_INDEX.lookup("regexsearcher"))
-    });
-    group.bench_function("fuzzy_miss", |bencher| bencher.iter(|| REGEX_INDEX.lookup(MISS)));
-    group.finish();
+#[divan::bench_group]
+mod lookup_regex {
+    use super::{Lookup, MISS, REGEX_INDEX};
+
+    #[divan::bench]
+    fn exact_path() -> Lookup<'static> {
+        REGEX_INDEX.lookup("regex::builders::bytes::RegexBuilder::build")
+    }
+
+    #[divan::bench]
+    fn unique_suffix() -> Lookup<'static> {
+        REGEX_INDEX.lookup("pattern::RegexSearcher")
+    }
+
+    #[divan::bench]
+    fn bare_name() -> Lookup<'static> {
+        REGEX_INDEX.lookup("regexsearcher")
+    }
+
+    #[divan::bench]
+    fn fuzzy_miss() -> Lookup<'static> {
+        REGEX_INDEX.lookup(MISS)
+    }
 }
 
 /// The same four queries against an index at the 50 000-item ceiling, which is
-/// where the linear scans and the per-item lowercasing actually hurt.
-fn lookup_synthetic_50k(criterion: &mut Criterion<WallTime>) {
-    let mut group = criterion.benchmark_group("lookup_synthetic_50k");
-    group.measurement_time(SLOW_MEASUREMENT);
-    group.bench_function("exact_path", |bencher| {
-        bencher.iter(|| SYNTHETIC_INDEX.lookup(&SYNTHETIC_EXACT));
-    });
-    group.bench_function("unique_suffix", |bencher| {
-        bencher.iter(|| SYNTHETIC_INDEX.lookup(&SYNTHETIC_SUFFIX));
-    });
-    group.bench_function("bare_name", |bencher| {
-        bencher.iter(|| SYNTHETIC_INDEX.lookup(&SYNTHETIC_NAME));
-    });
-    group.bench_function("fuzzy_miss", |bencher| bencher.iter(|| SYNTHETIC_INDEX.lookup(MISS)));
-    group.finish();
+/// where the linear scans and the per-item lowercasing used to hurt.
+#[divan::bench_group]
+mod lookup_synthetic_50k {
+    use super::{Lookup, MISS, SYNTHETIC_EXACT, SYNTHETIC_INDEX, SYNTHETIC_NAME, SYNTHETIC_SUFFIX};
+
+    #[divan::bench]
+    fn exact_path() -> Lookup<'static> {
+        SYNTHETIC_INDEX.lookup(&SYNTHETIC_EXACT)
+    }
+
+    #[divan::bench]
+    fn unique_suffix() -> Lookup<'static> {
+        SYNTHETIC_INDEX.lookup(&SYNTHETIC_SUFFIX)
+    }
+
+    #[divan::bench]
+    fn bare_name() -> Lookup<'static> {
+        SYNTHETIC_INDEX.lookup(&SYNTHETIC_NAME)
+    }
+
+    #[divan::bench]
+    fn fuzzy_miss() -> Lookup<'static> {
+        SYNTHETIC_INDEX.lookup(MISS)
+    }
+}
+
+/// The two parse paths that are not rustdoc JSON.
+#[divan::bench_group]
+mod documents {
+    use super::{CrateIndex, SERDE_INDEX, TOKIO_README, readme};
+
+    #[divan::bench]
+    fn crate_index_parse() -> CrateIndex {
+        CrateIndex::parse("serde", SERDE_INDEX).expect("the committed fixture parses")
+    }
+
+    #[divan::bench]
+    fn readme_to_markdown() -> String {
+        readme::to_markdown(TOKIO_README)
+    }
 }
 
 /// Reading an index back from the disk cache, against parsing it again.
 ///
-/// The comparison the cache exists to win: a warm session does the left-hand
-/// column, a cold one does `parse` above.
-fn disk_cache(criterion: &mut Criterion<WallTime>) {
-    let root = std::env::temp_dir().join(format!("mcp-crates-bench-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let store = Store::at(&root);
+/// The comparison the cache exists to win: a warm session does this, a cold one
+/// does `parse` above.
+#[divan::bench_group]
+mod disk_cache {
+    use super::{CACHE, DocIndex, REGEX_INDEX, SYNTHETIC_INDEX, docs};
 
-    let regex = REGEX.parse();
-    let synthetic = DocIndex::parse("synth", SYNTHETIC.as_bytes()).expect("parses");
-    store.store("regex@1.11.1", &regex.to_stored()).expect("stores");
-    store.store("synth@0.1.0", &synthetic.to_stored()).expect("stores");
+    #[divan::bench]
+    fn load_regex() -> DocIndex {
+        let stored =
+            CACHE.load::<docs::StoredIndex>("regex@1.11.1").expect("no error").expect("present");
+        DocIndex::from_stored(stored)
+    }
 
-    let mut group = criterion.benchmark_group("disk_cache");
-    group.measurement_time(SLOW_MEASUREMENT);
-    group.bench_function("load_regex", |bencher| {
-        bencher.iter(|| {
-            let stored = store
-                .load::<docs::StoredIndex>("regex@1.11.1")
-                .expect("no error")
-                .expect("present");
-            DocIndex::from_stored(stored)
-        });
-    });
-    group.bench_function("load_synthetic_50k", |bencher| {
-        bencher.iter(|| {
-            let stored =
-                store.load::<docs::StoredIndex>("synth@0.1.0").expect("no error").expect("present");
-            DocIndex::from_stored(stored)
-        });
-    });
-    group.bench_function("store_regex", |bencher| {
-        bencher.iter(|| store.store("regex@1.11.1", &regex.to_stored()).expect("stores"));
-    });
-    group.finish();
+    #[divan::bench]
+    fn load_synthetic_50k() -> DocIndex {
+        let stored =
+            CACHE.load::<docs::StoredIndex>("synth@0.1.0").expect("no error").expect("present");
+        DocIndex::from_stored(stored)
+    }
 
-    let _ = std::fs::remove_dir_all(&root);
-}
+    #[divan::bench]
+    fn store_regex() {
+        CACHE.store("regex@1.11.1", &REGEX_INDEX.to_stored()).expect("stores");
+    }
 
-/// The two parse paths that are not rustdoc JSON.
-fn documents(criterion: &mut Criterion<WallTime>) {
-    let mut group = criterion.benchmark_group("documents");
-    group.bench_function("crate_index_parse", |bencher| {
-        bencher.iter(|| CrateIndex::parse("serde", SERDE_INDEX).expect("the fixture parses"));
-    });
-    group.bench_function("readme_to_markdown", |bencher| {
-        bencher.iter(|| readme::to_markdown(TOKIO_README));
-    });
-    group.finish();
+    #[divan::bench]
+    fn store_synthetic_50k() {
+        CACHE.store("synth@0.1.0", &SYNTHETIC_INDEX.to_stored()).expect("stores");
+    }
 }
