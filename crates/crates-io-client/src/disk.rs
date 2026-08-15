@@ -82,6 +82,97 @@ pub enum Rejected {
     Undecodable,
 }
 
+/// A response body kept between runs, with everything needed to revalidate it.
+///
+/// A separate type from the in-memory `CachedBody` on purpose. That one dates
+/// its entries with `tokio::time::Instant`, which is monotonic within a process
+/// and meaningless outside one; this one uses the wall clock, because the
+/// question it has to answer is "how much of the lifetime granted by the origin
+/// is left" and the two processes asking never share a monotonic clock.
+#[derive(Debug, Serialize, serde::Deserialize)]
+pub struct StoredBody {
+    /// The already content-decoded body.
+    pub body: Vec<u8>,
+    /// The status it was served with. Only successes are ever stored.
+    pub status: u16,
+    /// `ETag`, verbatim — including its weakness marker, which the caller
+    /// strips at request time and must be free to keep stripping the same way.
+    pub etag: Option<String>,
+    /// `Last-Modified`, verbatim.
+    pub last_modified: Option<String>,
+    /// The URL that actually served it, after redirects.
+    ///
+    /// Kept because a validator belongs to this URL and not to the one first
+    /// asked; dropping it would let a validator be offered to an origin that
+    /// never issued it.
+    pub final_url: String,
+    /// Seconds since the Unix epoch at which it was stored or last revalidated.
+    pub stored_at_unix: u64,
+    /// How long the origin allowed it to be served without asking again.
+    pub fresh_for_secs: u64,
+}
+
+impl StoredBody {
+    /// How much of the granted lifetime is left, now.
+    ///
+    /// Zero is a perfectly good answer: an expired entry still carries its
+    /// validator, so it becomes a conditional request rather than a full
+    /// transfer, which is most of the saving anyway.
+    ///
+    /// A clock that has moved backwards since the entry was written makes
+    /// `duration_since` fail, and that is treated as fully expired. The bias is
+    /// deliberate and one-directional: a clock jump may cost a revalidation, and
+    /// can never extend a lifetime past what the origin granted.
+    #[must_use]
+    pub fn remaining_freshness(&self) -> std::time::Duration {
+        let stored_at =
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(self.stored_at_unix);
+        let elapsed = SystemTime::now().duration_since(stored_at).unwrap_or(
+            // Backwards clock: treat the entry as having used its whole life.
+            std::time::Duration::from_secs(self.fresh_for_secs),
+        );
+        std::time::Duration::from_secs(self.fresh_for_secs).saturating_sub(elapsed)
+    }
+
+    /// Seconds since the Unix epoch, for stamping a new record.
+    #[must_use]
+    pub fn now_unix() -> u64 {
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs()
+    }
+}
+
+/// The cache key for a response body.
+///
+/// Namespaced away from the documentation artifacts so the two kinds cannot
+/// collide, and carrying a hash of the whole URL so that the readable part is a
+/// convenience rather than the thing correctness rests on.
+#[must_use]
+pub fn body_key(url: &str) -> String {
+    let readable: String = url
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .take(48)
+        .collect();
+    format!("body-{readable}-{:016x}", stable_hash(url))
+}
+
+/// FNV-1a over the URL.
+///
+/// Deliberately not the hasher the rest of the crate uses: that one reseeds per
+/// process, which is exactly right for a hash map and exactly wrong for a name
+/// two processes have to agree on.
+fn stable_hash(text: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// A directory of immutable artifacts.
 #[derive(Clone, Debug)]
 pub struct Store {

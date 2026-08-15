@@ -153,6 +153,23 @@ fn counter(log: &std::path::Path, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("no {name} in the shutdown line of {}", log.display()))
 }
 
+/// How many of each artifact kind the directory holds, as (bodies, indexes).
+///
+/// The two are namespaced apart on purpose, and a test that could not tell them
+/// apart could not tell which half of the cache was doing the work.
+fn kinds(root: &std::path::Path) -> (usize, usize) {
+    let names: Vec<String> = fs::read_dir(root)
+        .map(|dir| {
+            dir.filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "mcpc"))
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let bodies = names.iter().filter(|name| name.starts_with("body-")).count();
+    (bodies, names.len() - bodies)
+}
+
 /// How many files the cache directory holds.
 fn entries(root: &std::path::Path) -> usize {
     fs::read_dir(root)
@@ -180,9 +197,12 @@ async fn a_second_session_answers_from_disk_without_asking_docs_rs_again() {
     let (cold_answer, cold_took) = cold.documentation().await;
     cold.shutdown().await;
 
-    assert_eq!(entries(&cache.0), 1, "the cold session should have left an entry behind");
+    // Two artifacts, one of each kind: the parsed documentation, and the
+    // sparse-index body that turned a crate name into a version.
+    assert_eq!(entries(&cache.0), 2, "the cold session should have left both artifacts behind");
+    assert_eq!(kinds(&cache.0), (1, 1), "one response body and one documentation index");
     assert_eq!(counter(&cold_log, "disk_hits"), 0, "a cold session hits nothing");
-    assert_eq!(counter(&cold_log, "disk_writes"), 1, "and writes what it built");
+    assert_eq!(counter(&cold_log, "disk_writes"), 2, "and writes both of what it built");
     let cold_requests = counter(&cold_log, "network_requests");
 
     // Warm: a different process, sharing only the directory.
@@ -203,13 +223,17 @@ async fn a_second_session_answers_from_disk_without_asking_docs_rs_again() {
 
     // The claim that matters, and the one that is exact: the rustdoc document
     // came off disk, so not one of its bytes crossed the wire a second time.
-    assert_eq!(counter(&warm_log, "disk_hits"), 1, "the warm session reads the index it stored");
+    assert_eq!(counter(&warm_log, "disk_hits"), 2, "the warm session reads both artifacts");
     assert_eq!(counter(&warm_log, "disk_writes"), 0, "and has nothing new to write");
 
+    // With the sparse index persisted too, the warm session has nothing left to
+    // ask anyone: the version it resolves and the document it reads both came
+    // off disk.
     let warm_requests = counter(&warm_log, "network_requests");
-    assert!(
-        warm_requests < cold_requests,
-        "warm made {warm_requests} requests against the cold session's {cold_requests}"
+    assert_eq!(
+        warm_requests, 0,
+        "the warm session made {warm_requests} requests against the cold session's \
+         {cold_requests}; it should need none"
     );
 
     let ratio = cold_took.as_secs_f64() / warm_took.as_secs_f64();
@@ -217,4 +241,5 @@ async fn a_second_session_answers_from_disk_without_asking_docs_rs_again() {
         "cold {cold_took:?} / {cold_requests} requests, warm {warm_took:?} / {warm_requests} \
          requests, {ratio:.1}x faster"
     );
+    assert!(ratio >= 5.0, "the warm session was only {ratio:.1}x faster than the cold one");
 }

@@ -41,6 +41,7 @@ use url::Url;
 use crate::{
     cache::CachedBody,
     config::Config,
+    disk::{Store as DiskStore, StoredBody, body_key},
     error::{Error, Result},
     gate::Gates,
     pacer::Pacer,
@@ -158,6 +159,8 @@ struct Counters {
     bytes_received: AtomicU64,
     shed: AtomicU64,
     retries: AtomicU64,
+    disk_hits: AtomicU64,
+    disk_writes: AtomicU64,
 }
 
 impl Counters {
@@ -170,10 +173,8 @@ impl Counters {
             bytes_received: self.bytes_received.load(Ordering::Relaxed),
             shed: self.shed.load(Ordering::Relaxed),
             retries: self.retries.load(Ordering::Relaxed),
-            // Filled in by the client: the disk cache sits above the fetcher,
-            // which is why it can report requests these two avoided.
-            disk_hits: 0,
-            disk_writes: 0,
+            disk_hits: self.disk_hits.load(Ordering::Relaxed),
+            disk_writes: self.disk_writes.load(Ordering::Relaxed),
         }
     }
 }
@@ -200,6 +201,8 @@ pub struct Fetcher {
     jitter: AtomicU64,
     max_body_bytes: usize,
     max_retries: u32,
+    /// Where a persistable body survives between runs, when it may.
+    disk: Option<DiskStore>,
 }
 
 impl Fetcher {
@@ -247,6 +250,15 @@ impl Fetcher {
             jitter: AtomicU64::new(0x9E37_79B9_7F4A_7C15),
             max_body_bytes: config.max_body_bytes,
             max_retries: config.max_retries,
+            disk: config
+                .disk_cache
+                .then(|| {
+                    config
+                        .cache_dir
+                        .clone()
+                        .map_or_else(DiskStore::discover, |root| Some(DiskStore::at(root)))
+                })
+                .flatten(),
         })
     }
 
@@ -292,13 +304,31 @@ impl Fetcher {
         let gate = self.gates.get(&key).await;
         let _guard = gate.lock().await;
 
-        let stale = self.bodies.get(&key).await;
+        let mut stale = self.bodies.get(&key).await;
         if let Some(hit) = &stale
             && hit.is_fresh()
         {
             // Another caller refreshed this entry while we waited.
             self.counters.coalesced.fetch_add(1, Ordering::Relaxed);
             return Self::interpret(Arc::clone(hit));
+        }
+
+        // The third tier, consulted only when memory holds nothing at all and
+        // only for the one kind of body worth keeping between runs. It sits
+        // inside the gate, so concurrent callers still cost one read rather
+        // than one each.
+        if stale.is_none()
+            && let Some(restored) = self.load_from_disk(url).await
+        {
+            if restored.is_fresh() {
+                self.counters.disk_hits.fetch_add(1, Ordering::Relaxed);
+                self.bodies.insert(Arc::clone(&key), Arc::clone(&restored)).await;
+                return Self::interpret(restored);
+            }
+            // Expired, but it still carries the validator the origin issued, so
+            // the request below becomes a conditional one. That is most of the
+            // saving: a `304` transfers headers instead of a document.
+            stale = Some(restored);
         }
 
         let validators = stale.as_deref().filter(|e| e.status < 300 && e.has_validator());
@@ -323,7 +353,69 @@ impl Fetcher {
         if cacheable {
             self.bodies.insert(Arc::clone(&key), Arc::clone(&entry)).await;
         }
+        // Only successes are persisted. An absence is remembered in memory for
+        // a minute so a typo does not spend the budget twice, and that is a
+        // within-session courtesy rather than a fact worth carrying to the next
+        // run — a crate that did not exist an hour ago may exist now. Keeping
+        // this to successes also means nothing read back off disk can be an
+        // error body, so the provenance argument in `extract_detail` never has
+        // to reason about bytes that came from a file.
+        if entry.status < 300 {
+            self.store_to_disk(url, &entry).await;
+        }
         Self::interpret(entry)
+    }
+
+    /// Read a persistable body back, or `None` if there is nothing usable.
+    async fn load_from_disk(&self, url: &str) -> Option<Arc<CachedBody>> {
+        let store = self.disk.clone()?;
+        if !persistable(url) {
+            return None;
+        }
+        let key = body_key(url);
+        let stored = tokio::task::spawn_blocking(move || store.load::<StoredBody>(&key))
+            .await
+            .ok()?
+            .ok()??;
+
+        Some(Arc::new(CachedBody::new(
+            bytes::Bytes::from(stored.body.clone()),
+            stored.status,
+            stored.etag.clone().map(Into::into),
+            stored.last_modified.clone().map(Into::into),
+            stored.final_url.clone().into_boxed_str(),
+            stored.remaining_freshness(),
+        )))
+    }
+
+    /// Keep a persistable body for the next run.
+    ///
+    /// Awaited rather than detached: a session that answered and exited without
+    /// the write landing would leave the cache empty exactly when sessions are
+    /// short, which is the case it exists for. The cost is an encode of a body
+    /// that was just transferred over the network.
+    async fn store_to_disk(&self, url: &str, entry: &CachedBody) {
+        let Some(store) = self.disk.clone() else { return };
+        if !persistable(url) {
+            return;
+        }
+        let key = body_key(url);
+        let record = StoredBody {
+            body: entry.body.to_vec(),
+            status: entry.status,
+            etag: entry.etag.as_ref().map(ToString::to_string),
+            last_modified: entry.last_modified.as_ref().map(ToString::to_string),
+            final_url: entry.final_url.to_string(),
+            stored_at_unix: StoredBody::now_unix(),
+            fresh_for_secs: entry.fresh_for().as_secs(),
+        };
+        match tokio::task::spawn_blocking(move || store.store(&key, &record)).await {
+            Ok(Ok(())) => {
+                self.counters.disk_writes.fetch_add(1, Ordering::Relaxed);
+            },
+            Ok(Err(err)) => tracing::debug!(%err, url, "could not cache the response body"),
+            Err(err) => tracing::debug!(%err, url, "the response cache writer did not finish"),
+        }
     }
 
     /// Turn a cached entry into a result, mapping non-success statuses to errors.
@@ -572,6 +664,23 @@ const fn is_absence(status: u16, origin: Origin) -> bool {
     matches!(status, 404) || (status == 403 && matches!(origin, Origin::Cdn))
 }
 
+/// Whether a URL's body may be kept on disk between runs.
+///
+/// The sparse index and nothing else. It is the one body large enough to be
+/// worth keeping and cheap enough to revalidate — a conditional request costs
+/// headers where a transfer costs a document — and it is the request every
+/// documentation lookup makes first, to turn a crate name into a version.
+///
+/// Everything else stays in memory on purpose. Search results and crate
+/// metadata reflect registry state that moves; a rendered README is immutable
+/// but is already reached through the API and would need its redirect cached to
+/// save anything; rustdoc JSON is kept in its far more useful parsed form by
+/// the layer above this one.
+fn persistable(url: &str) -> bool {
+    Url::parse(url)
+        .is_ok_and(|url| url.scheme() == "https" && url.host_str() == Some("index.crates.io"))
+}
+
 /// Classify a URL's host, rejecting anything outside the allowed set.
 ///
 /// Applied to every hop, this is what stops a redirect from steering the client
@@ -729,6 +838,137 @@ fn truncate(text: &str) -> String {
         end -= 1;
     }
     format!("{}...", &text[..end])
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_sparse_index_is_kept_between_runs() {
+        // The confinement rule, written where a reader looking for it will
+        // find it. Widening this set is the change that would need the
+        // reasoning in `persistable` revisited, not a passing thought.
+        for kept in [
+            "https://index.crates.io/se/rd/serde",
+            "https://index.crates.io/1/a",
+            "https://index.crates.io/to/ki/tokio-util",
+        ] {
+            assert!(persistable(kept), "{kept} is a sparse-index document");
+        }
+        for dropped in [
+            "https://crates.io/api/v1/crates/serde",
+            "https://crates.io/api/v1/crates?q=serde",
+            "https://static.crates.io/readmes/serde/serde-1.0.219.html",
+            "https://docs.rs/crate/serde/1.0.219/json",
+            "https://docs.rs/crate/serde/1.0.219/status.json",
+            "http://index.crates.io/se/rd/serde",
+            "https://index.crates.io.evil.example/se/rd/serde",
+            "not a url at all",
+        ] {
+            assert!(!persistable(dropped), "{dropped} must not be written to disk");
+        }
+    }
+
+    #[test]
+    fn a_record_carries_the_remainder_of_its_lifetime_across_a_process_boundary() {
+        // What a second process has to be able to work out: not "was this
+        // fresh when it was written" but "how much of what the origin granted
+        // is left now".
+        let record = |age: u64, granted: u64| StoredBody {
+            body: b"{}".to_vec(),
+            status: 200,
+            etag: Some("\"abc\"".to_owned()),
+            last_modified: None,
+            final_url: "https://index.crates.io/se/rd/serde".to_owned(),
+            stored_at_unix: StoredBody::now_unix() - age,
+            fresh_for_secs: granted,
+        };
+
+        // Ranges, not equalities: the stamp has one-second granularity, so a
+        // record written "now" can already read as a second old.
+        let just_now = record(0, 600).remaining_freshness().as_secs();
+        assert!((599..=600).contains(&just_now), "written just now, got {just_now}");
+        let partly = record(100, 600).remaining_freshness().as_secs();
+        assert!((499..=500).contains(&partly), "most of a ten-minute life left, got {partly}");
+        assert_eq!(record(600, 600).remaining_freshness(), Duration::ZERO, "exactly used up");
+        assert_eq!(record(6_000, 600).remaining_freshness(), Duration::ZERO, "long expired");
+    }
+
+    #[test]
+    fn a_clock_that_moved_backwards_expires_an_entry_rather_than_extending_it() {
+        // The only direction a clock jump may push this. Believing a record
+        // written "in the future" would serve a body for longer than the origin
+        // allowed, which is the one thing the freshness rule may never do.
+        let from_the_future = StoredBody {
+            body: b"{}".to_vec(),
+            status: 200,
+            etag: None,
+            last_modified: None,
+            final_url: "https://index.crates.io/se/rd/serde".to_owned(),
+            stored_at_unix: StoredBody::now_unix() + 86_400,
+            fresh_for_secs: 600,
+        };
+        assert_eq!(from_the_future.remaining_freshness(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_restored_entry_keeps_the_url_its_validator_belongs_to() {
+        // `validator_applies` compares the hop being requested against the URL
+        // that served the body. A record that lost `final_url` would offer an
+        // `ETag` to an origin that never issued it.
+        let stored = StoredBody {
+            body: b"{}".to_vec(),
+            status: 200,
+            etag: Some("W/\"abc\"".to_owned()),
+            last_modified: None,
+            final_url: "https://index.crates.io/se/rd/serde".to_owned(),
+            stored_at_unix: StoredBody::now_unix(),
+            fresh_for_secs: 600,
+        };
+        let restored = CachedBody::new(
+            bytes::Bytes::from(stored.body.clone()),
+            stored.status,
+            stored.etag.clone().map(Into::into),
+            stored.last_modified.clone().map(Into::into),
+            stored.final_url.clone().into_boxed_str(),
+            stored.remaining_freshness(),
+        );
+
+        let same = Url::parse("https://index.crates.io/se/rd/serde").expect("parses");
+        let other = Url::parse("https://index.crates.io/se/rd/serde_json").expect("parses");
+        assert!(validator_applies(&same, &restored));
+        assert!(!validator_applies(&other, &restored));
+        // And the weakness marker survives storage, so the request-time
+        // stripping keeps behaving as it always did.
+        assert_eq!(if_none_match(restored.etag.as_deref().expect("stored")), "\"abc\"");
+    }
+
+    #[test]
+    fn two_urls_never_share_a_cache_key() {
+        let keys: Vec<String> = [
+            "https://index.crates.io/se/rd/serde",
+            "https://index.crates.io/se/rd/serde_json",
+            "https://index.crates.io/3/l/log",
+            "https://index.crates.io/1/a",
+        ]
+        .iter()
+        .map(|url| crate::disk::body_key(url))
+        .collect();
+
+        let mut unique = keys.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), keys.len(), "keys collided: {keys:?}");
+        assert_eq!(
+            crate::disk::body_key("https://index.crates.io/se/rd/serde"),
+            keys[0],
+            "the same URL must produce the same name in every process"
+        );
+        // Namespaced away from the documentation artifacts, which are keyed
+        // `name@version`.
+        assert!(keys.iter().all(|key| key.starts_with("body-")));
+    }
 }
 
 #[cfg(test)]

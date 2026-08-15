@@ -64,6 +64,15 @@ impl CachedBody {
         self.stored_at.elapsed() < self.fresh_for
     }
 
+    /// How long this entry was granted when it was stored.
+    ///
+    /// Read when persisting the entry, so the record on disk carries the
+    /// lifetime the origin actually allowed rather than the one configured.
+    #[must_use]
+    pub fn fresh_for(&self) -> Duration {
+        self.fresh_for
+    }
+
     /// Whether the entry carries a validator usable for a conditional request.
     #[must_use]
     pub fn has_validator(&self) -> bool {

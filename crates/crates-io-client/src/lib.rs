@@ -202,9 +202,13 @@ impl Client {
     /// Cache and traffic counters, for diagnostics.
     #[must_use]
     pub fn stats(&self) -> Stats {
+        // Added to rather than replacing what the fetcher reports: both tiers
+        // keep artifacts in the same directory and save the same thing — a
+        // request — so an operator reading one pair of counters is reading how
+        // much the disk cache did, of either kind.
         let mut stats = self.fetcher.stats();
-        stats.disk_hits = self.disk_hits.load(Ordering::Relaxed);
-        stats.disk_writes = self.disk_writes.load(Ordering::Relaxed);
+        stats.disk_hits += self.disk_hits.load(Ordering::Relaxed);
+        stats.disk_writes += self.disk_writes.load(Ordering::Relaxed);
         stats
     }
 

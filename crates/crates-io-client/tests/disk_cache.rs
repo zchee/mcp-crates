@@ -7,7 +7,11 @@
 
 use std::{fs, path::PathBuf};
 
-use crates_io_client::{Client, Config, DocIndex, disk::Store, docs};
+use crates_io_client::{
+    Client, Config, DocIndex,
+    disk::{Store, StoredBody, body_key},
+    docs,
+};
 
 /// Larger than the fixture expands to.
 const LIMIT: usize = 64 * 1024 * 1024;
@@ -214,4 +218,145 @@ fn a_stored_index_is_smaller_than_the_document_it_was_built_from() {
         "the cache entry ({stored} B) is larger than the download it replaces ({} B)",
         COMPRESSED.len()
     );
+}
+
+/// The captured `serde` sparse-index document and the URL it came from.
+const INDEX_URL: &str = "https://index.crates.io/se/rd/serde";
+const INDEX_BODY: &[u8] = include_bytes!("../fixtures/serde.index.json");
+
+/// Seed a sparse-index body as a previous process would have left it.
+fn seed_index(store: &Store, age_secs: u64, fresh_for_secs: u64, etag: Option<&str>) {
+    store
+        .store(
+            &body_key(INDEX_URL),
+            &StoredBody {
+                body: INDEX_BODY.to_vec(),
+                status: 200,
+                etag: etag.map(ToOwned::to_owned),
+                last_modified: None,
+                final_url: INDEX_URL.to_owned(),
+                stored_at_unix: StoredBody::now_unix() - age_secs,
+                fresh_for_secs,
+            },
+        )
+        .expect("the cache is writable");
+}
+
+#[tokio::test]
+async fn a_fresh_index_body_resolves_a_version_without_a_request() {
+    // The whole point of artifact 4b: a new process turns a crate name into a
+    // version without asking anyone, because the last one wrote down what the
+    // CDN said and how long it said it for.
+    let dir = TempDir::new("index-fresh");
+    seed_index(&Store::at(&dir.0), 0, 600, Some("\"abc\""));
+
+    let client = Client::new(config(Some(&dir.0), true)).expect("builds");
+    let index = client.index("serde").await.expect("answers from the cache");
+
+    assert_eq!(index.name(), "serde");
+    assert_eq!(index.len(), 316, "the whole document was restored, not a prefix");
+    let stats = client.stats();
+    assert_eq!(stats.network_requests, 0, "nothing should have gone on the wire");
+    assert_eq!(stats.disk_hits, 1);
+}
+
+#[tokio::test]
+async fn two_clients_sharing_a_directory_both_answer_without_a_request() {
+    let dir = TempDir::new("index-shared");
+    seed_index(&Store::at(&dir.0), 0, 600, Some("\"abc\""));
+
+    for attempt in 0..2 {
+        let client = Client::new(config(Some(&dir.0), true)).expect("builds");
+        let index = client.index("serde").await.expect("answers");
+        assert_eq!(index.len(), 316, "attempt {attempt}");
+        assert_eq!(client.stats().network_requests, 0, "attempt {attempt}");
+    }
+}
+
+#[tokio::test]
+async fn an_index_body_is_not_read_when_the_cache_is_disabled() {
+    let dir = TempDir::new("index-disabled");
+    seed_index(&Store::at(&dir.0), 0, 600, Some("\"abc\""));
+
+    // No network here, so the call cannot succeed; the counter is the point.
+    let client = Client::new(config(Some(&dir.0), false)).expect("builds");
+    let _ = client.index("serde").await;
+    assert_eq!(client.stats().disk_hits, 0, "the file should not have been read");
+}
+
+#[tokio::test]
+async fn a_damaged_index_body_is_discarded_rather_than_served() {
+    let dir = TempDir::new("index-damaged");
+    let store = Store::at(&dir.0);
+    seed_index(&store, 0, 600, Some("\"abc\""));
+
+    let path = dir.0.join(format!("{}.mcpc", body_key(INDEX_URL)));
+    let mut damaged = fs::read(&path).expect("readable");
+    let middle = damaged.len() / 2;
+    damaged[middle] ^= 0b0001_0000;
+    fs::write(&path, &damaged).expect("writable");
+
+    let client = Client::new(config(Some(&dir.0), true)).expect("builds");
+    let _ = client.index("serde").await;
+
+    assert_eq!(client.stats().disk_hits, 0, "a damaged body is not a hit");
+    // Deleted on rejection. If this machine has network access the refetch will
+    // have written a good file back in its place, which is the right outcome
+    // too — what must not survive is the damaged copy.
+    if path.exists() {
+        assert_ne!(fs::read(&path).expect("readable"), damaged, "the damaged copy survived");
+        assert!(
+            Store::at(&dir.0).load::<StoredBody>(&body_key(INDEX_URL)).expect("no error").is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_expired_index_body_is_not_served_as_if_it_were_fresh() {
+    // Expired is not the same as useless — it still carries the validator, so
+    // the request it causes is conditional. What must not happen is it being
+    // served without asking at all.
+    let dir = TempDir::new("index-expired");
+    seed_index(&Store::at(&dir.0), 6_000, 600, Some("\"abc\""));
+
+    let client = Client::new(config(Some(&dir.0), true)).expect("builds");
+    let _ = client.index("serde").await;
+
+    assert_eq!(client.stats().disk_hits, 0, "an expired body is not a hit");
+}
+
+#[test]
+fn a_stored_body_is_rejected_the_same_way_a_stored_index_is() {
+    // The corrupt matrix, on the second artifact kind. The guards live in one
+    // place, but "the same guards apply" is worth asserting rather than
+    // assuming.
+    let dir = TempDir::new("body-corrupt");
+    let store = Store::at(&dir.0);
+    let key = body_key(INDEX_URL);
+    seed_index(&store, 0, 600, Some("\"abc\""));
+
+    let path = dir.0.join(format!("{key}.mcpc"));
+    let good = fs::read(&path).expect("readable");
+
+    let cases: [(&str, Vec<u8>); 5] = [
+        ("shorter than a header", good[..8].to_vec()),
+        ("not one of ours", b"some other file entirely".to_vec()),
+        ("a different schema", {
+            let mut bytes = good.clone();
+            bytes[8] = bytes[8].wrapping_add(1);
+            bytes
+        }),
+        ("a different bitcode format", {
+            let mut bytes = good.clone();
+            bytes[12] = bytes[12].wrapping_add(1);
+            bytes
+        }),
+        ("a truncated body", good[..good.len() - 4].to_vec()),
+    ];
+
+    for (label, bytes) in cases {
+        fs::write(&path, &bytes).expect("writable");
+        assert!(store.load::<StoredBody>(&key).expect("no error").is_none(), "{label}");
+        assert!(!path.exists(), "{label}: the unusable file should have been removed");
+    }
 }
