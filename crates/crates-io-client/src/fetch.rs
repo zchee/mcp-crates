@@ -1,0 +1,735 @@
+//! Cache-aware, rate-limited HTTP fetching.
+//!
+//! Every byte this crate reads from the network passes through [`Fetcher::get`],
+//! which layers four independent savings on top of a plain request:
+//!
+//! 1. **Freshness.** A cached response inside its lifetime is returned without touching
+//!    the network at all, so it costs nothing against the request budget.
+//! 2. **Coalescing.** Concurrent callers asking for the same URL are funnelled through
+//!    one gate, so a burst of tool calls issues a single request.
+//! 3. **Revalidation.** A stale response that carries an `ETag` or `Last-Modified` is
+//!    refreshed with a conditional request, so the common `304` answer transfers headers
+//!    instead of a body.
+//! 4. **Pacing.** Whatever survives the layers above is emitted through a per-origin
+//!    [`Pacer`], which is what actually enforces the crates.io one-request-per-second
+//!    policy.
+//!
+//! Redirects are followed manually rather than by `reqwest`, for two reasons:
+//! each hop must be paced and counted like any other request, and each hop must
+//! be checked against the allowed host list so that a redirect cannot steer the
+//! client at an arbitrary origin.
+
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+use bytes::BytesMut;
+use moka::future::Cache;
+use reqwest::{
+    StatusCode,
+    header::{
+        CACHE_CONTROL, ETAG, HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION,
+        RETRY_AFTER,
+    },
+};
+use url::Url;
+
+use crate::{
+    cache::CachedBody,
+    config::Config,
+    error::{Error, Result},
+    pacer::Pacer,
+};
+
+/// Most redirect hops the client will follow for one logical request.
+const MAX_REDIRECTS: u8 = 5;
+
+/// Longest error detail retained from an upstream error body.
+const MAX_DETAIL_LEN: usize = 240;
+
+/// An upstream host this client is permitted to contact.
+///
+/// Each origin has its own pacing budget, because the three differ by orders of
+/// magnitude in how much traffic they are built to absorb.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// The crates.io REST API, limited to one request per second by policy.
+    Api,
+    /// The crates.io static CDN hosts: the sparse index and rendered READMEs.
+    Cdn,
+    /// docs.rs, used for build status and rustdoc JSON.
+    Docs,
+}
+
+impl Origin {
+    /// Classify a host, or return `None` if the client must not contact it.
+    #[must_use]
+    fn classify(host: &str) -> Option<Self> {
+        match host {
+            "crates.io" => Some(Self::Api),
+            "index.crates.io" | "static.crates.io" => Some(Self::Cdn),
+            "docs.rs" | "static.docs.rs" => Some(Self::Docs),
+            _ => None,
+        }
+    }
+
+    /// The host label used in diagnostics.
+    #[must_use]
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Api => "crates.io",
+            Self::Cdn => "crates.io CDN",
+            Self::Docs => "docs.rs",
+        }
+    }
+}
+
+/// How one request should interact with the shared cache.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct Policy {
+    /// How long a successful response may be served without revalidation.
+    pub ttl: Duration,
+    /// How long a `404` is remembered.
+    pub negative_ttl: Duration,
+    /// Whether the body is kept in the shared cache.
+    ///
+    /// Set to `false` for payloads that are large and only useful once parsed;
+    /// the caller caches the parsed projection instead.
+    pub store: bool,
+}
+
+impl Policy {
+    /// A cached policy with the given lifetime.
+    #[must_use]
+    pub fn cached(ttl: Duration, negative_ttl: Duration) -> Self {
+        Self {
+            ttl,
+            negative_ttl,
+            store: true,
+        }
+    }
+}
+
+/// Counters describing how well the caching layers are working.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Stats {
+    /// Responses served from cache without any network traffic.
+    pub cache_hits: u64,
+    /// Requests that found a fresh entry after waiting behind another caller,
+    /// i.e. requests saved by coalescing.
+    pub coalesced: u64,
+    /// Requests actually put on the wire, including redirect hops.
+    pub network_requests: u64,
+    /// Conditional requests answered with `304 Not Modified`.
+    pub not_modified: u64,
+    /// Response body bytes received.
+    pub bytes_received: u64,
+    /// Requests shed because the pacing queue was saturated.
+    pub shed: u64,
+    /// Transient failures that were retried.
+    pub retries: u64,
+}
+
+#[derive(Debug, Default)]
+struct Counters {
+    cache_hits: AtomicU64,
+    coalesced: AtomicU64,
+    network_requests: AtomicU64,
+    not_modified: AtomicU64,
+    bytes_received: AtomicU64,
+    shed: AtomicU64,
+    retries: AtomicU64,
+}
+
+impl Counters {
+    fn snapshot(&self) -> Stats {
+        Stats {
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            coalesced: self.coalesced.load(Ordering::Relaxed),
+            network_requests: self.network_requests.load(Ordering::Relaxed),
+            not_modified: self.not_modified.load(Ordering::Relaxed),
+            bytes_received: self.bytes_received.load(Ordering::Relaxed),
+            shed: self.shed.load(Ordering::Relaxed),
+            retries: self.retries.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Outcome of a single trip to the network.
+enum Wire {
+    /// A body was transferred.
+    Body(CachedBody),
+    /// The origin confirmed the cached copy is still current.
+    NotModified,
+}
+
+/// The shared HTTP layer.
+#[derive(Debug)]
+pub struct Fetcher {
+    client: reqwest::Client,
+    bodies: Cache<Arc<str>, Arc<CachedBody>>,
+    gates: Cache<Arc<str>, Arc<tokio::sync::Mutex<()>>>,
+    api: Pacer,
+    cdn: Pacer,
+    docs: Pacer,
+    counters: Counters,
+    jitter: AtomicU64,
+    max_body_bytes: usize,
+    max_retries: u32,
+}
+
+impl Fetcher {
+    /// Build a fetcher from a configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the user agent is empty or the underlying HTTP
+    /// client cannot be constructed.
+    pub fn new(config: &Config) -> Result<Self> {
+        if config.user_agent.trim().is_empty() {
+            return Err(Error::InvalidArgument(
+                "the user agent must not be empty: crates.io requires a header that identifies \
+                 the application and offers a way to make contact"
+                    .to_owned(),
+            ));
+        }
+
+        let client = reqwest::Client::builder()
+            .user_agent(config.user_agent.clone())
+            // Redirects are handled by this module so that every hop is paced
+            // and host-checked.
+            .redirect(reqwest::redirect::Policy::none())
+            .https_only(true)
+            .timeout(config.request_timeout)
+            .connect_timeout(config.connect_timeout)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(8)
+            .tcp_keepalive(Duration::from_secs(60))
+            .tcp_nodelay(true)
+            .build()
+            .map_err(|source| Error::Network {
+                url: "<client construction>".to_owned(),
+                source,
+            })?;
+
+        Ok(Self {
+            client,
+            bodies: Cache::builder()
+                .max_capacity(config.cache_capacity_bytes)
+                .weigher(|_key: &Arc<str>, value: &Arc<CachedBody>| value.weight())
+                .build(),
+            // Gates only exist to serialize concurrent callers, so they are
+            // bounded by count and expire once nobody is waiting.
+            gates: Cache::builder()
+                .max_capacity(4096)
+                .time_to_idle(Duration::from_secs(60))
+                .build(),
+            api: Pacer::new("crates.io", config.api_min_interval, config.max_queue_wait),
+            cdn: Pacer::new(
+                "crates.io CDN",
+                config.cdn_min_interval,
+                config.max_queue_wait,
+            ),
+            docs: Pacer::new("docs.rs", config.docs_min_interval, config.max_queue_wait),
+            counters: Counters::default(),
+            jitter: AtomicU64::new(0x9E37_79B9_7F4A_7C15),
+            max_body_bytes: config.max_body_bytes,
+            max_retries: config.max_retries,
+        })
+    }
+
+    /// A snapshot of the cache and traffic counters.
+    #[must_use]
+    pub fn stats(&self) -> Stats {
+        self.counters.snapshot()
+    }
+
+    /// How far each origin's pacing queue currently extends.
+    #[must_use]
+    pub fn backlog(&self) -> (Duration, Duration, Duration) {
+        (self.api.backlog(), self.cdn.backlog(), self.docs.backlog())
+    }
+
+    fn pacer(&self, origin: Origin) -> &Pacer {
+        match origin {
+            Origin::Api => &self.api,
+            Origin::Cdn => &self.cdn,
+            Origin::Docs => &self.docs,
+        }
+    }
+
+    /// Fetch a URL, consulting and populating the shared cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Upstream`] for any non-success status, including a
+    /// cached `404`, and [`Error::Network`] for transport failures that
+    /// survived the retry budget.
+    pub async fn get(&self, url: &str, policy: Policy) -> Result<Arc<CachedBody>> {
+        let key: Arc<str> = Arc::from(url);
+
+        if let Some(hit) = self.bodies.get(&key).await
+            && hit.is_fresh()
+        {
+            self.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
+            return Self::interpret(hit);
+        }
+
+        // Serialize concurrent callers for this URL so a burst costs one
+        // request rather than one per caller.
+        let gate = self
+            .gates
+            .get_with(Arc::clone(&key), async {
+                Arc::new(tokio::sync::Mutex::new(()))
+            })
+            .await;
+        let _guard = gate.lock().await;
+
+        let stale = self.bodies.get(&key).await;
+        if let Some(hit) = &stale
+            && hit.is_fresh()
+        {
+            // Another caller refreshed this entry while we waited.
+            self.counters.coalesced.fetch_add(1, Ordering::Relaxed);
+            return Self::interpret(Arc::clone(hit));
+        }
+
+        let validators = stale
+            .as_deref()
+            .filter(|e| e.status < 300 && e.has_validator());
+        let entry = match self.fetch_with_retry(url, validators, policy).await? {
+            Wire::Body(body) => Arc::new(body),
+            Wire::NotModified => {
+                self.counters.not_modified.fetch_add(1, Ordering::Relaxed);
+                let previous = stale.as_deref().ok_or_else(|| Error::Upstream {
+                    url: url.to_owned(),
+                    status: 304,
+                    detail: Some("the origin sent 304 without a cached copy to refresh".to_owned()),
+                })?;
+                Arc::new(previous.revalidated(policy.ttl))
+            },
+        };
+
+        let cacheable = (policy.store && entry.status < 300) || entry.status == 404;
+        if cacheable {
+            self.bodies
+                .insert(Arc::clone(&key), Arc::clone(&entry))
+                .await;
+        }
+        Self::interpret(entry)
+    }
+
+    /// Turn a cached entry into a result, mapping non-success statuses to errors.
+    fn interpret(entry: Arc<CachedBody>) -> Result<Arc<CachedBody>> {
+        if (200..300).contains(&entry.status) {
+            return Ok(entry);
+        }
+        Err(Error::Upstream {
+            url: entry.final_url.to_string(),
+            status: entry.status,
+            detail: extract_detail(&entry.body),
+        })
+    }
+
+    /// Issue a request, retrying transient failures with decorrelated backoff.
+    async fn fetch_with_retry(
+        &self,
+        url: &str,
+        validators: Option<&CachedBody>,
+        policy: Policy,
+    ) -> Result<Wire> {
+        let mut attempt = 0;
+        loop {
+            match self.fetch_once(url, validators, policy).await {
+                Ok(outcome) => return Ok(outcome),
+                Err(err) if err.is_transient() && attempt < self.max_retries => {
+                    attempt += 1;
+                    self.counters.retries.fetch_add(1, Ordering::Relaxed);
+                    let delay = self.backoff(attempt);
+                    tracing::debug!(
+                        url,
+                        attempt,
+                        delay_ms = delay.as_millis(),
+                        error = %err,
+                        "retrying transient upstream failure"
+                    );
+                    tokio::time::sleep(delay).await;
+                },
+                Err(err) => {
+                    if matches!(err, Error::RateLimitQueueFull { .. }) {
+                        self.counters.shed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Err(err);
+                },
+            }
+        }
+    }
+
+    /// Exponential backoff with decorrelating jitter.
+    ///
+    /// The jitter is drawn from a counter mixed with a large odd constant
+    /// instead of a random source: it only needs to keep concurrent retries
+    /// from re-colliding, which does not require true randomness.
+    fn backoff(&self, attempt: u32) -> Duration {
+        let base_ms = 200_u64 << attempt.min(4);
+        let mixed = self
+            .jitter
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let spread = (mixed >> 33) % (base_ms / 2 + 1);
+        Duration::from_millis(base_ms + spread)
+    }
+
+    /// One logical request, following redirects manually.
+    async fn fetch_once(
+        &self,
+        url: &str,
+        validators: Option<&CachedBody>,
+        policy: Policy,
+    ) -> Result<Wire> {
+        let mut current = Url::parse(url).map_err(|err| Error::UnsupportedUrl {
+            url: url.to_owned(),
+            reason: err.to_string(),
+        })?;
+        let mut hops = 0_u8;
+
+        loop {
+            let origin = classify(&current)?;
+            self.pacer(origin).acquire().await?;
+
+            let mut request = self.client.get(current.clone());
+            // Validators describe the originally requested resource, so they
+            // only apply before any redirect is followed.
+            if hops == 0
+                && let Some(cached) = validators
+            {
+                if let Some(etag) = &cached.etag {
+                    request = request.header(IF_NONE_MATCH, etag.as_ref());
+                } else if let Some(modified) = &cached.last_modified {
+                    request = request.header(IF_MODIFIED_SINCE, modified.as_ref());
+                }
+            }
+
+            let response = request.send().await.map_err(|source| Error::Network {
+                url: current.to_string(),
+                source,
+            })?;
+            self.counters
+                .network_requests
+                .fetch_add(1, Ordering::Relaxed);
+
+            let status = response.status();
+            if status == StatusCode::NOT_MODIFIED {
+                return Ok(Wire::NotModified);
+            }
+
+            if status.is_redirection() {
+                hops += 1;
+                if hops > MAX_REDIRECTS {
+                    return Err(Error::UnsupportedUrl {
+                        url: url.to_owned(),
+                        reason: format!("more than {MAX_REDIRECTS} redirects"),
+                    });
+                }
+                let location = response
+                    .headers()
+                    .get(LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| Error::UnsupportedUrl {
+                        url: current.to_string(),
+                        reason: format!("HTTP {status} without a usable Location header"),
+                    })?;
+                current = current
+                    .join(location)
+                    .map_err(|err| Error::UnsupportedUrl {
+                        url: current.to_string(),
+                        reason: format!("unusable Location {location:?}: {err}"),
+                    })?;
+                continue;
+            }
+
+            if status.as_u16() == 429 || status.is_server_error() {
+                let backoff = retry_after(response.headers());
+                if let Some(backoff) = backoff {
+                    self.pacer(origin).penalize(backoff);
+                    tracing::warn!(
+                        host = origin.label(),
+                        status = status.as_u16(),
+                        backoff_ms = backoff.as_millis(),
+                        "upstream asked the client to slow down"
+                    );
+                }
+                let body = self.read_body(response, &current).await.unwrap_or_default();
+                return Err(Error::Upstream {
+                    url: current.to_string(),
+                    status: status.as_u16(),
+                    detail: extract_detail(&body),
+                });
+            }
+
+            let headers = response.headers().clone();
+            let final_url = current.to_string();
+            let body = self.read_body(response, &current).await?;
+            self.counters
+                .bytes_received
+                .fetch_add(body.len() as u64, Ordering::Relaxed);
+
+            let ttl = if status.as_u16() == 404 {
+                policy.negative_ttl
+            } else {
+                effective_ttl(policy.ttl, &headers)
+            };
+
+            return Ok(Wire::Body(CachedBody::new(
+                body.freeze(),
+                status.as_u16(),
+                header_string(&headers, ETAG),
+                header_string(&headers, LAST_MODIFIED),
+                final_url.into_boxed_str(),
+                ttl,
+            )));
+        }
+    }
+
+    /// Read a response body, refusing to buffer more than the configured limit.
+    async fn read_body(&self, response: reqwest::Response, url: &Url) -> Result<BytesMut> {
+        let limit = self.max_body_bytes;
+        if let Some(declared) = response.content_length()
+            && declared > limit as u64
+        {
+            return Err(Error::BodyTooLarge {
+                url: url.to_string(),
+                limit,
+            });
+        }
+
+        let hint = response
+            .content_length()
+            .unwrap_or(16 * 1024)
+            .min(limit as u64);
+        let mut buffer = BytesMut::with_capacity(usize::try_from(hint).unwrap_or(16 * 1024));
+        let mut response = response;
+        while let Some(chunk) = response.chunk().await.map_err(|source| Error::Network {
+            url: url.to_string(),
+            source,
+        })? {
+            // Content-Length is absent or pre-decompression when the transfer is
+            // compressed, so the ceiling is also enforced as bytes arrive.
+            if buffer.len() + chunk.len() > limit {
+                return Err(Error::BodyTooLarge {
+                    url: url.to_string(),
+                    limit,
+                });
+            }
+            buffer.extend_from_slice(&chunk);
+        }
+        Ok(buffer)
+    }
+}
+
+/// Classify a URL's host, rejecting anything outside the allowed set.
+///
+/// Applied to every hop, this is what stops a redirect from steering the client
+/// at an unrelated origin.
+fn classify(url: &Url) -> Result<Origin> {
+    if url.scheme() != "https" {
+        return Err(Error::UnsupportedUrl {
+            url: url.to_string(),
+            reason: format!("scheme {:?} is not https", url.scheme()),
+        });
+    }
+    let host = url.host_str().unwrap_or_default();
+    Origin::classify(host).ok_or_else(|| Error::UnsupportedUrl {
+        url: url.to_string(),
+        reason: format!("host {host:?} is not a crates.io or docs.rs origin"),
+    })
+}
+
+/// Copy a header into an owned string, if present and valid UTF-8.
+fn header_string(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Option<Box<str>> {
+    headers.get(name)?.to_str().ok().map(Box::from)
+}
+
+/// Clamp the configured lifetime by whatever the origin permits.
+///
+/// The client never serves a response for longer than the origin allows, but it
+/// also does not extend its own lifetime just because the origin offered more.
+fn effective_ttl(configured: Duration, headers: &HeaderMap) -> Duration {
+    let Some(control) = headers
+        .get(CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return configured;
+    };
+    for directive in control.split(',') {
+        let directive = directive.trim();
+        if directive.eq_ignore_ascii_case("no-store") || directive.eq_ignore_ascii_case("no-cache")
+        {
+            return Duration::ZERO;
+        }
+        if let Some(seconds) = directive
+            .strip_prefix("max-age=")
+            .or_else(|| directive.strip_prefix("max-age ="))
+            && let Ok(seconds) = seconds.trim().parse::<u64>()
+        {
+            return configured.min(Duration::from_secs(seconds));
+        }
+    }
+    configured
+}
+
+/// Parse a `Retry-After` delay expressed in seconds.
+///
+/// The HTTP-date form is accepted by the spec but not emitted by these origins;
+/// an unparsable value falls back to a conservative pause rather than none.
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let raw = headers.get(RETRY_AFTER)?.to_str().ok()?;
+    match raw.trim().parse::<u64>() {
+        Ok(seconds) => Some(Duration::from_secs(seconds.min(300))),
+        Err(_) => Some(Duration::from_secs(5)),
+    }
+}
+
+/// Pull a human-readable message out of an upstream error body.
+///
+/// crates.io answers with `{"errors":[{"detail":"..."}]}`; other origins answer
+/// with text or HTML, which is truncated rather than surfaced whole.
+fn extract_detail(body: &[u8]) -> Option<String> {
+    if body.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(body)
+        && let Some(errors) = value.get("errors").and_then(serde_json::Value::as_array)
+    {
+        let joined = errors
+            .iter()
+            .filter_map(|entry| entry.get("detail").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if !joined.is_empty() {
+            return Some(truncate(&joined));
+        }
+    }
+    let text = String::from_utf8_lossy(body);
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.starts_with('<') {
+        return None;
+    }
+    Some(truncate(trimmed))
+}
+
+fn truncate(text: &str) -> String {
+    if text.len() <= MAX_DETAIL_LEN {
+        return text.to_owned();
+    }
+    let mut end = MAX_DETAIL_LEN;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(reqwest::header::HeaderName, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(name.clone(), value.parse().expect("valid header value"));
+        }
+        map
+    }
+
+    #[test]
+    fn only_crates_io_and_docs_rs_origins_are_reachable() {
+        let cases = [
+            ("https://crates.io/api/v1/crates", Some(Origin::Api)),
+            ("https://index.crates.io/se/rd/serde", Some(Origin::Cdn)),
+            (
+                "https://static.crates.io/readmes/serde/serde-1.0.0.html",
+                Some(Origin::Cdn),
+            ),
+            ("https://docs.rs/crate/serde/1.0.0/json", Some(Origin::Docs)),
+            ("https://evil.invalid/steal", None),
+            // A lookalike host must not be accepted by a suffix match.
+            ("https://crates.io.evil.invalid/", None),
+        ];
+        for (raw, expected) in cases {
+            let url = Url::parse(raw).expect("valid url");
+            assert_eq!(classify(&url).ok(), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn plaintext_urls_are_refused() {
+        let url = Url::parse("http://crates.io/api/v1/crates").expect("valid url");
+        assert!(matches!(classify(&url), Err(Error::UnsupportedUrl { .. })));
+    }
+
+    #[test]
+    fn upstream_max_age_shortens_but_never_extends_the_configured_ttl() {
+        let configured = Duration::from_secs(600);
+
+        let shorter = headers(&[(CACHE_CONTROL, "public, max-age=60")]);
+        assert_eq!(effective_ttl(configured, &shorter), Duration::from_secs(60));
+
+        let longer = headers(&[(CACHE_CONTROL, "public,max-age=604800")]);
+        assert_eq!(effective_ttl(configured, &longer), configured);
+
+        let forbidden = headers(&[(CACHE_CONTROL, "no-store")]);
+        assert_eq!(effective_ttl(configured, &forbidden), Duration::ZERO);
+
+        assert_eq!(effective_ttl(configured, &HeaderMap::new()), configured);
+    }
+
+    #[test]
+    fn retry_after_is_parsed_and_bounded() {
+        assert_eq!(
+            retry_after(&headers(&[(RETRY_AFTER, "12")])),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(
+            retry_after(&headers(&[(RETRY_AFTER, "99999")])),
+            Some(Duration::from_secs(300)),
+            "an absurd delay is capped rather than obeyed"
+        );
+        assert_eq!(
+            retry_after(&headers(&[(RETRY_AFTER, "Wed, 21 Oct 2026 07:28:00 GMT")])),
+            Some(Duration::from_secs(5)),
+            "an HTTP-date falls back to a conservative pause"
+        );
+        assert_eq!(retry_after(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn error_detail_comes_from_the_crates_io_error_shape() {
+        let body = br#"{"errors":[{"detail":"Not Found"},{"detail":"and more"}]}"#;
+        assert_eq!(extract_detail(body), Some("Not Found; and more".to_owned()));
+
+        assert_eq!(extract_detail(b""), None);
+        assert_eq!(
+            extract_detail(b"<!DOCTYPE html><html></html>"),
+            None,
+            "html is not a message"
+        );
+        assert_eq!(
+            extract_detail(b"plain failure"),
+            Some("plain failure".to_owned())
+        );
+    }
+
+    #[test]
+    fn long_details_are_truncated_on_a_character_boundary() {
+        let body = "\u{3042}".repeat(200);
+        let detail = extract_detail(body.as_bytes()).expect("some detail");
+        assert!(detail.ends_with("..."));
+        assert!(detail.len() <= MAX_DETAIL_LEN + 3);
+    }
+}
