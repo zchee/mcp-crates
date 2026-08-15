@@ -652,10 +652,14 @@ fn extract_detail(body: &[u8]) -> Option<String> {
         }
     }
     let text = String::from_utf8_lossy(body);
-    // Tidiness only, deliberately: a leading byte-order mark would otherwise
-    // ride along into a message a human reads. Nothing safety-relevant rests on
-    // this being exhaustive — that is `is_markup`'s job, and it does not care
-    // what came before the tag.
+    // Tidiness only: a leading byte-order mark would otherwise ride along into
+    // a message a human reads. Nothing safety-relevant rests on this set being
+    // exhaustive, and that is structural rather than incidental — none of the
+    // characters below is alphanumeric or `<`, so trimming cannot delete either
+    // of the two things `is_markup` looks for, and trimming only from the ends
+    // cannot reorder what remains. Both offsets shift together and the
+    // comparison is unchanged. Adding a letter or `<` to this set is the one
+    // edit that would break that, and would need `is_markup` reconsidered.
     let trimmed = text.trim_matches(|character: char| {
         character.is_whitespace()
             || character.is_control()
@@ -685,6 +689,15 @@ fn extract_detail(body: &[u8]) -> Option<String> {
 /// `str::trim` sees only the White_Space property, `char::is_control` only the
 /// Cc range, and a byte-order mark, a soft hyphen and the bidi controls are all
 /// Cf. Ordering sidesteps the whole question.
+///
+/// Both misclassifications are known and neither is a hole. A body whose markup
+/// is preceded by prose — `404 Not Found\n<html>`, which some proxies emit —
+/// reads as a message and its markup reaches the caller. That is acceptable
+/// because shape was never the property being protected: those bytes are still
+/// composed by the registry, its CDN or an intermediary, and no publisher
+/// artifact reaches this path whatever the body looks like. In the other
+/// direction a `<` with no letter or digit anywhere reads as markup and the
+/// detail is dropped, which is the right default for something unrecognised.
 fn is_markup(text: &str) -> bool {
     let Some(angle) = text.find('<') else {
         return false;
@@ -999,6 +1012,18 @@ mod tests {
             let body = format!("{prefix}<html>fail</html>");
             assert_eq!(extract_detail(body.as_bytes()), None, "{prefix:?} must not evade it");
         }
+    }
+
+    #[test]
+    fn markup_introduced_by_prose_is_let_through_on_purpose() {
+        // Some proxies put a status line ahead of the document. This reads as a
+        // message and its markup reaches the caller, which is deliberate: the
+        // reason a detail needs no framing is that the registry, its CDN or an
+        // intermediary composed the bytes, not what shape they arrived in.
+        // Anyone tempted to close this should know they are trading a
+        // cosmetic improvement for the enumeration problem this rule escaped.
+        let proxied = b"404 Not Found\n<html><body>gone</body></html>";
+        assert!(extract_detail(proxied).is_some());
     }
 
     #[test]
