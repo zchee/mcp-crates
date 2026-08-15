@@ -551,18 +551,6 @@ fn if_none_match(etag: &str) -> &str {
     etag.strip_prefix("W/").unwrap_or(etag)
 }
 
-/// Whether a character carries no visible content and so cannot be the start of
-/// a message.
-///
-/// Covers the zero-width format characters as well as whitespace, because a
-/// document is free to open with a byte-order mark and the check that follows
-/// this one has to see the first character that actually renders.
-fn is_invisible(character: char) -> bool {
-    character.is_whitespace()
-        || character.is_control()
-        || matches!(character, '\u{feff}' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}')
-}
-
 /// Whether a status means "this resource is not there", and so is worth
 /// remembering briefly.
 ///
@@ -664,22 +652,44 @@ fn extract_detail(body: &[u8]) -> Option<String> {
         }
     }
     let text = String::from_utf8_lossy(body);
-    // Not `trim`: it removes only characters with the White_Space property, and
-    // a byte-order mark or a zero-width space is category Cf, so a document
-    // opening with one would keep its markup out of reach of the check below.
-    let trimmed = text.trim_matches(is_invisible);
-    // Dropping markup is what keeps this detail free of anything a crate author
-    // wrote, and consumers rely on that: the detail is reported to a caller
-    // unframed, on the grounds that only the registry itself composes these
-    // strings. The two responses that could carry publisher-adjacent bytes are
-    // both markup — the CDN answers a missing README object with an XML error
-    // document, docs.rs with an HTML page — so this guard is the reason the
-    // grounds hold. Salvaging text out of markup here would make the channel
-    // publisher-reachable and that decision would have to be revisited.
-    if trimmed.is_empty() || trimmed.starts_with('<') {
+    // Tidiness only, deliberately: a leading byte-order mark would otherwise
+    // ride along into a message a human reads. Nothing safety-relevant rests on
+    // this being exhaustive — that is `is_markup`'s job, and it does not care
+    // what came before the tag.
+    let trimmed = text.trim_matches(|character: char| {
+        character.is_whitespace()
+            || character.is_control()
+            || matches!(character, '\u{feff}' | '\u{200b}' | '\u{00ad}')
+    });
+    if trimmed.is_empty() || is_markup(trimmed) {
         return None;
     }
     Some(truncate(trimmed))
+}
+
+/// Whether a body is a markup document rather than a message.
+///
+/// Dropping markup is what keeps an error detail free of anything a crate
+/// author wrote, and consumers rely on that: the detail reaches a caller
+/// unframed, on the grounds that only the registry itself composes these
+/// strings. The two responses that could carry publisher-adjacent bytes are
+/// both markup — the CDN answers a missing README object with an XML error
+/// document, docs.rs with an HTML page — so this is the reason those grounds
+/// hold. Salvaging text out of markup here would make the channel
+/// publisher-reachable, and that decision would have to be revisited.
+///
+/// Asking whether a `<` comes before any letter or digit, rather than whether
+/// the text starts with one, is what makes it hold. A prefix test is defeated
+/// by any invisible character in front of the tag, and there is no way to
+/// enumerate those without dragging in a Unicode character-category table:
+/// `str::trim` sees only the White_Space property, `char::is_control` only the
+/// Cc range, and a byte-order mark, a soft hyphen and the bidi controls are all
+/// Cf. Ordering sidesteps the whole question.
+fn is_markup(text: &str) -> bool {
+    let Some(angle) = text.find('<') else {
+        return false;
+    };
+    text.find(char::is_alphanumeric).is_none_or(|word| angle < word)
 }
 
 fn truncate(text: &str) -> String {
@@ -973,20 +983,36 @@ mod tests {
 
         assert_eq!(extract_detail(b"   \n  <html>"), None, "leading whitespace does not evade it");
 
-        // A byte-order mark and a zero-width space are category Cf, which
-        // `str::trim` leaves in place. Without accounting for them the guard
-        // would see the mark rather than the `<` and pass the markup through.
-        assert_eq!(extract_detail("\u{feff}<html>fail</html>".as_bytes()), None, "BOM prefix");
-        assert_eq!(extract_detail("\u{200b}<html>fail</html>".as_bytes()), None, "ZWSP prefix");
-        assert_eq!(extract_detail("\u{2060}\u{feff} <Error/>".as_bytes()), None, "mixed prefix");
+        // Every one of these is an invisible character that `str::trim` leaves
+        // in place, so a prefix test would see the character rather than the
+        // `<` and pass the markup straight through. They span three different
+        // reasons for being invisible, which is why the guard asks about
+        // ordering instead of enumerating them.
+        for prefix in [
+            "\u{feff}", // byte-order mark
+            "\u{200b}", // zero-width space
+            "\u{00ad}", // soft hyphen
+            "\u{202e}", // right-to-left override
+            "\u{2066}", // left-to-right isolate
+            "\u{2060}\u{feff} ",
+        ] {
+            let body = format!("{prefix}<html>fail</html>");
+            assert_eq!(extract_detail(body.as_bytes()), None, "{prefix:?} must not evade it");
+        }
     }
 
     #[test]
-    fn invisible_prefixes_do_not_swallow_a_real_message() {
+    fn a_message_that_merely_contains_an_angle_bracket_is_still_a_message() {
+        // The ordering rule has to keep prose that happens to use `<`, or an
+        // upstream complaint about a version bound would vanish.
+        assert_eq!(
+            extract_detail(b"version must be < 2.0"),
+            Some("version must be < 2.0".to_owned())
+        );
         assert_eq!(
             extract_detail("\u{feff}rate limited".as_bytes()),
             Some("rate limited".to_owned()),
-            "trimming the mark must not discard the message behind it"
+            "an invisible prefix on a real message must not discard it"
         );
     }
 
