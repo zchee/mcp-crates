@@ -20,6 +20,7 @@ use serde::{
 use crate::{
     error::{Error, Result},
     index::validate_name,
+    version::validate_version,
 };
 
 /// How many alternative items a fuzzy lookup will suggest.
@@ -33,7 +34,10 @@ const MAX_ITEMS: usize = 50_000;
 #[non_exhaustive]
 pub struct BuildStatus {
     /// Whether the documentation build succeeded.
-    #[serde(default)]
+    ///
+    /// Deliberately required: defaulting it would turn any unrecognised
+    /// response, including one from a changed docs.rs schema, into a confident
+    /// "the build failed" instead of a decode error.
     pub doc_status: bool,
     /// The version docs.rs resolved the request to.
     #[serde(default)]
@@ -620,6 +624,7 @@ pub fn decompress_rustdoc(name: &str, body: &[u8], limit: usize) -> Result<Vec<u
 /// Returns [`Error::InvalidCrateName`] for an invalid name.
 pub fn status_url(name: &str, version: &str) -> Result<String> {
     validate_name(name)?;
+    validate_version(version)?;
     Ok(format!("https://docs.rs/crate/{name}/{version}/status.json"))
 }
 
@@ -630,6 +635,7 @@ pub fn status_url(name: &str, version: &str) -> Result<String> {
 /// Returns [`Error::InvalidCrateName`] for an invalid name.
 pub fn rustdoc_url(name: &str, version: &str) -> Result<String> {
     validate_name(name)?;
+    validate_version(version)?;
     Ok(format!("https://docs.rs/crate/{name}/{version}/json"))
 }
 
@@ -640,6 +646,7 @@ pub fn rustdoc_url(name: &str, version: &str) -> Result<String> {
 /// Returns [`Error::InvalidCrateName`] for an invalid name.
 pub fn html_url(name: &str, version: &str) -> Result<String> {
     validate_name(name)?;
+    validate_version(version)?;
     Ok(format!("https://docs.rs/{name}/{version}/{}/", name.replace('-', "_")))
 }
 
@@ -923,6 +930,15 @@ mod tests {
     }
 
     #[test]
+    fn an_unrecognised_build_status_is_a_decode_error_not_a_failed_build() {
+        assert!(serde_json::from_str::<BuildStatus>(r#"{"doc_status":true}"#).is_ok());
+        assert!(
+            serde_json::from_str::<BuildStatus>("{}").is_err(),
+            "an empty object must not read as a failed build"
+        );
+    }
+
+    #[test]
     fn docs_rs_urls_use_the_underscored_module_name() {
         assert_eq!(
             html_url("tokio-util", "0.7.0").expect("builds"),
@@ -933,5 +949,14 @@ mod tests {
             "https://docs.rs/crate/serde/1.0.0/status.json"
         );
         assert!(matches!(rustdoc_url("../evil", "1.0.0"), Err(Error::InvalidCrateName { .. })));
+        // `Url::join` resolves dot segments, so an unchecked version reaches a
+        // different endpoint entirely.
+        assert!(matches!(
+            crate::api::readme_url("serde", "1.0.0/../../../owners"),
+            Err(Error::InvalidVersion { .. })
+        ));
+        for builder in [status_url, rustdoc_url, html_url] {
+            assert!(matches!(builder("serde", "1.0.0?x=1"), Err(Error::InvalidVersion { .. })));
+        }
     }
 }

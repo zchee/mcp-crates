@@ -12,6 +12,7 @@ use url::Url;
 use crate::{
     error::{Error, Result},
     index::validate_name,
+    version::validate_version,
 };
 
 /// Base URL of the public crates.io API.
@@ -297,6 +298,9 @@ pub struct CrateResponse {
 /// release history means hundreds of kilobytes of per-version records. Asking
 /// for only what is needed is the difference between a few kilobytes and a few
 /// hundred.
+// Not `#[non_exhaustive]`, unlike the response types: a caller builds one of
+// these to say what it wants, which the attribute would make impossible from
+// outside the crate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Include {
     /// Include the keyword list.
@@ -373,9 +377,11 @@ pub fn crate_url(name: &str, include: Include) -> Result<String> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidCrateName`] for an invalid name.
+/// Returns [`Error::InvalidCrateName`] for an invalid name, or
+/// [`Error::InvalidVersion`] for a version that could not be a path segment.
 pub fn readme_url(name: &str, version: &str) -> Result<String> {
     validate_name(name)?;
+    validate_version(version)?;
     let url = Url::parse(API_BASE)
         .and_then(|base| base.join(&format!("crates/{name}/{version}/readme")))
         .map_err(|err| Error::InvalidArgument(format!("could not build the readme URL: {err}")))?;

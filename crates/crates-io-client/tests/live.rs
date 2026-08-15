@@ -50,6 +50,7 @@ async fn the_live_registry_behaves_as_this_crate_expects() {
     concurrent_questions_share_one_request(&client).await;
     api_requests_are_paced(&client).await;
     a_stale_copy_is_revalidated_rather_than_refetched().await;
+    a_readme_is_revalidated_across_its_redirect().await;
 
     let stats = client.stats();
     eprintln!(
@@ -138,6 +139,51 @@ async fn readmes_arrive_as_markdown(client: &Client) {
     assert!(readme.contains("anyhow"), "the README should mention the crate");
     assert!(!readme.contains("<p>"), "HTML should have been converted to Markdown");
     assert!(!readme.contains("<img"), "images should have been dropped");
+
+    // A second reader with a different budget must get its own budget applied.
+    // The conversion is memoized against the cached response, so folding the
+    // budget into it would have pinned the first caller's 40 000 characters -
+    // or, in the other order, a small budget - onto every later reader for the
+    // seven days the document stays cached.
+    let clipped = client.readme("anyhow", &version, 200).await.expect("anyhow has a README");
+    assert!(clipped.chars().count() < readme.chars().count(), "the budget was ignored");
+    assert!(clipped.ends_with("[README truncated]"), "{clipped}");
+
+    let full_again = client.readme("anyhow", &version, 40_000).await.expect("anyhow has a README");
+    assert_eq!(
+        full_again.as_str(),
+        readme.as_str(),
+        "an earlier small budget must not have been baked into the cached document"
+    );
+}
+
+/// A README is requested from the API and served from the CDN, so its `ETag`
+/// belongs to the CDN URL rather than the one the request started at.
+/// Revalidation only works if the validator is sent to the host that issued it.
+async fn a_readme_is_revalidated_across_its_redirect() {
+    let ttl = Ttl { readme: Duration::from_millis(1), ..Ttl::default() };
+    let client = Client::with_ttl(Config::new(USER_AGENT), ttl).expect("the client builds");
+
+    let index = client.index("anyhow").await.expect("anyhow is indexed");
+    let version = index.resolve(&Selector::Default, false).expect("a release exists").vers.clone();
+
+    client.readme("anyhow", &version, 40_000).await.expect("anyhow has a README");
+    let after_first = client.stats();
+    assert_eq!(after_first.not_modified, 0, "the first fetch cannot be a revalidation");
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let again = client.readme("anyhow", &version, 40_000).await.expect("anyhow has a README");
+
+    let after_second = client.stats();
+    assert_eq!(
+        after_second.not_modified, 1,
+        "the stale README should have been revalidated at the host that served it"
+    );
+    assert_eq!(
+        after_second.bytes_received, after_first.bytes_received,
+        "a 304 transfers headers, not a body"
+    );
+    assert!(!again.is_empty());
 }
 
 async fn item_documentation_is_read_from_rustdoc_json(client: &Client) {

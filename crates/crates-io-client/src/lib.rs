@@ -58,6 +58,7 @@ mod config;
 mod docs;
 mod error;
 mod fetch;
+mod gate;
 mod index;
 mod pacer;
 mod readme;
@@ -67,7 +68,6 @@ use std::{sync::Arc, time::Duration};
 
 use moka::future::Cache;
 
-use crate::fetch::{Fetcher, Policy};
 pub use crate::{
     api::{
         Category as CrateCategory, CrateResponse, CrateSummary, Include, Keyword, SearchMeta,
@@ -81,16 +81,16 @@ pub use crate::{
     readme::DEFAULT_MAX_CHARS as DEFAULT_README_CHARS,
     version::Selector,
 };
-
-/// How long a downloaded rustdoc document is kept in its compressed form.
-///
-/// The parsed index is what callers actually use and is cached for far longer;
-/// retaining the compressed bytes briefly exists only so that callers arriving
-/// together share one download.
-const RUSTDOC_BODY_TTL: Duration = Duration::from_secs(60);
+use crate::{
+    fetch::{Fetcher, Policy},
+    gate::Gates,
+};
 
 /// Approximate ceiling on the parsed-documentation cache.
 const DOC_INDEX_CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How many crate versions may have a documentation gate at once.
+const DOC_GATE_CAPACITY: u64 = 256;
 
 /// A client for crates.io, its sparse index, and docs.rs.
 ///
@@ -101,6 +101,7 @@ pub struct Client {
     fetcher: Fetcher,
     ttl: Ttl,
     doc_indexes: Cache<Arc<str>, Arc<DocIndex>>,
+    doc_gates: Gates,
     max_rustdoc_bytes: usize,
 }
 
@@ -129,6 +130,7 @@ impl Client {
                 .weigher(|_key: &Arc<str>, value: &Arc<DocIndex>| value.weight())
                 .time_to_live(ttl.rustdoc)
                 .build(),
+            doc_gates: Gates::new(DOC_GATE_CAPACITY),
             max_rustdoc_bytes: config.max_rustdoc_bytes,
         })
     }
@@ -218,10 +220,18 @@ impl Client {
             .get(&url, Policy::cached(self.ttl.readme, self.ttl.negative))
             .await
             .map_err(|err| missing_readme(err, name, version))?;
-        body.derive(|bytes| {
+        // Only the conversion is memoized. Folding `max_chars` into the
+        // memoized value would pin the first caller's budget onto every later
+        // reader of the same cached document, for as long as it stays cached.
+        let markdown = body.derive(|bytes| {
             let html = String::from_utf8_lossy(bytes);
-            Ok::<_, Error>(readme::to_markdown(&html, max_chars))
-        })
+            Ok::<_, Error>(readme::to_markdown(&html))
+        })?;
+
+        if markdown.chars().count() <= max_chars {
+            return Ok(markdown);
+        }
+        Ok(Arc::new(readme::truncate(&markdown, max_chars)))
     }
 
     /// Fetch a release's docs.rs build status.
@@ -262,12 +272,22 @@ impl Client {
             return Ok(hit);
         }
 
+        // Coalesced here rather than relying on the HTTP layer's gate, because
+        // the expensive part is downstream of the transfer: decompressing and
+        // parsing several megabytes, which concurrent callers would otherwise
+        // each do in full only to keep one result.
+        let gate = self.doc_gates.get(&key).await;
+        let _guard = gate.lock().await;
+        if let Some(hit) = self.doc_indexes.get(&key).await {
+            return Ok(hit);
+        }
+
         let url = docs::rustdoc_url(name, version)?;
-        let body = self
-            .fetcher
-            .get(&url, Policy::cached(RUSTDOC_BODY_TTL, self.ttl.negative))
-            .await
-            .map_err(|err| {
+        // The body is not retained: its parsed form is roughly ten times its
+        // compressed size, and the body cache is bounded by transferred bytes,
+        // so keeping it would hold far more memory than that bound describes.
+        let body =
+            self.fetcher.get(&url, Policy::uncached(self.ttl.negative)).await.map_err(|err| {
                 missing_docs(
                     err,
                     name,

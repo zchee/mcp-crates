@@ -75,6 +75,39 @@ impl Selector {
     }
 }
 
+/// Longest version string any of these registries will accept.
+const MAX_VERSION_LEN: usize = 64;
+
+/// Check a version string before it is spliced into a URL path.
+///
+/// The server only ever passes versions it resolved from an index document, but
+/// this crate is usable on its own, and a caller-supplied version reaches the
+/// same path segments a crate name does. `Url::join` resolves `..`, and `?` and
+/// `#` start a query and a fragment, so an unchecked version can steer a
+/// request the same way an unchecked name could. This applies the same
+/// discipline [`crate::validate_name`] applies to names.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidVersion`] for an empty, over-long, or
+/// non-conforming version.
+pub fn validate_version(version: &str) -> Result<(), Error> {
+    // The semver character set, which is all any published version can use.
+    let conforming = !version.is_empty()
+        && version.len() <= MAX_VERSION_LEN
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'));
+    if conforming {
+        Ok(())
+    } else {
+        Err(Error::InvalidVersion {
+            value: version.to_owned(),
+            reason: format!("versions must be 1-{MAX_VERSION_LEN} characters of [A-Za-z0-9.+-_]"),
+        })
+    }
+}
+
 /// Pick the best of a set of candidate versions.
 ///
 /// Candidates are supplied as `(index, version, yanked)` triples. Ranking
@@ -171,6 +204,32 @@ mod tests {
         // not be handed back as "the latest version" of the crate.
         let releases = [("1.0.0", false), ("1.1.0", true)];
         assert_eq!(pick(&releases, "latest", true).as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn versions_that_could_escape_the_url_path_are_rejected() {
+        for bad in [
+            "",
+            "1.0.0/../../../owners",
+            "1.0.0?include=full",
+            "1.0.0#frag",
+            "../secrets",
+            "1.0.0 ",
+            "https://evil.invalid",
+            &"1".repeat(65),
+        ] {
+            assert!(
+                matches!(validate_version(bad), Err(Error::InvalidVersion { .. })),
+                "{bad:?} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn real_version_strings_are_accepted() {
+        for good in ["1.0.0", "0.1.0-alpha.1", "1.0.0+build.5", "latest", "1.0.0-rc_1"] {
+            assert!(validate_version(good).is_ok(), "{good:?} should have been accepted");
+        }
     }
 
     #[test]

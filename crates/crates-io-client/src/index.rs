@@ -216,8 +216,10 @@ impl CrateIndex {
         by_version.sort_by(|&left, &right| {
             match (entries[left].version(), entries[right].version()) {
                 (Some(a), Some(b)) => a.cmp(b),
-                // Unparsable versions keep their publication order, behind
-                // everything that did parse.
+                // Versions that are not valid semver cannot be ordered
+                // against ones that are, so they are parked at the bottom of
+                // the ascending order. That puts them last in `descending`,
+                // which is what callers asking for the newest release read.
                 (Some(_), None) => std::cmp::Ordering::Greater,
                 (None, Some(_)) => std::cmp::Ordering::Less,
                 (None, None) => left.cmp(&right),

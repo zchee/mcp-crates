@@ -42,6 +42,7 @@ use crate::{
     cache::CachedBody,
     config::Config,
     error::{Error, Result},
+    gate::Gates,
     pacer::Pacer,
 };
 
@@ -56,6 +57,7 @@ const MAX_DETAIL_LEN: usize = 240;
 /// Each origin has its own pacing budget, because the three differ by orders of
 /// magnitude in how much traffic they are built to absorb.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Origin {
     /// The crates.io REST API, limited to one request per second by policy.
     Api,
@@ -108,6 +110,17 @@ impl Policy {
     #[must_use]
     pub fn cached(ttl: Duration, negative_ttl: Duration) -> Self {
         Self { ttl, negative_ttl, store: true }
+    }
+
+    /// Fetch without retaining the body.
+    ///
+    /// For a payload that is only useful once parsed and whose parsed form is
+    /// far larger than the bytes it came from: keeping the body would also pin
+    /// the projection memoized beside it, and the body cache is bounded by
+    /// transferred bytes, which would then understate what is being held.
+    #[must_use]
+    pub fn uncached(negative_ttl: Duration) -> Self {
+        Self { ttl: Duration::ZERO, negative_ttl, store: false }
     }
 }
 
@@ -171,7 +184,7 @@ enum Wire {
 pub struct Fetcher {
     client: reqwest::Client,
     bodies: Cache<Arc<str>, Arc<CachedBody>>,
-    gates: Cache<Arc<str>, Arc<tokio::sync::Mutex<()>>>,
+    gates: Gates,
     api: Pacer,
     cdn: Pacer,
     docs: Pacer,
@@ -218,12 +231,7 @@ impl Fetcher {
                 .max_capacity(config.cache_capacity_bytes)
                 .weigher(|_key: &Arc<str>, value: &Arc<CachedBody>| value.weight())
                 .build(),
-            // Gates only exist to serialize concurrent callers, so they are
-            // bounded by count and expire once nobody is waiting.
-            gates: Cache::builder()
-                .max_capacity(4096)
-                .time_to_idle(Duration::from_secs(60))
-                .build(),
+            gates: Gates::new(4096),
             api: Pacer::new("crates.io", config.api_min_interval, config.max_queue_wait),
             cdn: Pacer::new("crates.io CDN", config.cdn_min_interval, config.max_queue_wait),
             docs: Pacer::new("docs.rs", config.docs_min_interval, config.max_queue_wait),
@@ -273,10 +281,7 @@ impl Fetcher {
 
         // Serialize concurrent callers for this URL so a burst costs one
         // request rather than one per caller.
-        let gate = self
-            .gates
-            .get_with(Arc::clone(&key), async { Arc::new(tokio::sync::Mutex::new(())) })
-            .await;
+        let gate = self.gates.get(&key).await;
         let _guard = gate.lock().await;
 
         let stale = self.bodies.get(&key).await;
@@ -302,7 +307,11 @@ impl Fetcher {
             },
         };
 
-        let cacheable = (policy.store && entry.status < 300) || is_absence(entry.status);
+        // The origin matters for what counts as absence, and after redirects it
+        // is the origin that served the body, not the one first asked.
+        let served_by = Url::parse(&entry.final_url).ok().and_then(|url| classify(&url).ok());
+        let absent = served_by.is_some_and(|origin| is_absence(entry.status, origin));
+        let cacheable = (policy.store && entry.status < 300) || absent;
         if cacheable {
             self.bodies.insert(Arc::clone(&key), Arc::clone(&entry)).await;
         }
@@ -385,13 +394,16 @@ impl Fetcher {
             self.pacer(origin).acquire().await?;
 
             let mut request = self.client.get(current.clone());
-            // Validators describe the originally requested resource, so they
-            // only apply before any redirect is followed.
-            if hops == 0
-                && let Some(cached) = validators
+            // A validator only means anything to the URL that issued it, which
+            // is where the cached body came from — not necessarily where the
+            // request started. A README is requested from the API and served
+            // from the CDN, so sending its `ETag` to the API would revalidate
+            // nothing and the CDN hop would re-transfer the whole body.
+            if let Some(cached) = validators
+                && current.as_str() == cached.final_url.as_ref()
             {
                 if let Some(etag) = &cached.etag {
-                    request = request.header(IF_NONE_MATCH, etag.as_ref());
+                    request = request.header(IF_NONE_MATCH, if_none_match(etag));
                 } else if let Some(modified) = &cached.last_modified {
                     request = request.header(IF_MODIFIED_SINCE, modified.as_ref());
                 }
@@ -460,7 +472,7 @@ impl Fetcher {
             let body = self.read_body(response, &current).await?;
             self.counters.bytes_received.fetch_add(body.len() as u64, Ordering::Relaxed);
 
-            let ttl = if is_absence(status.as_u16()) {
+            let ttl = if is_absence(status.as_u16(), origin) {
                 policy.negative_ttl
             } else {
                 effective_ttl(policy.ttl, &headers)
@@ -505,18 +517,33 @@ impl Fetcher {
     }
 }
 
+/// Build an `If-None-Match` value from a cached entity tag.
+///
+/// A tag arrives weak (`W/"x"`) whenever the crates.io CDN compressed the
+/// response it came from, and that origin will not match its own weak form:
+/// handing `W/"x"` back returns the whole body again, while `"x"` returns
+/// `304`, with or without compression negotiated. Offering both as a list does
+/// not help either, so the weakness marker is dropped.
+///
+/// This is sound rather than a trick. `If-None-Match` is defined to compare
+/// weakly, under which `W/"x"` and `"x"` are the same entity tag, so nothing is
+/// claimed that the cached tag did not already assert. A changed entity gets a
+/// changed tag regardless, so no stale copy can be validated by this.
+fn if_none_match(etag: &str) -> &str {
+    etag.strip_prefix("W/").unwrap_or(etag)
+}
+
 /// Whether a status means "this resource is not there", and so is worth
 /// remembering briefly.
 ///
-/// `404` is the obvious one. `403` is here because the crates.io static CDN is
-/// object storage without list permission, which answers a request for an
-/// object that was never stored with `403` rather than `404` — the case for any
-/// release published before rendered READMEs existed. Remembering it for the
-/// negative lifetime keeps a caller from re-spending an API request on the same
-/// absent document; the lifetime is short enough that a genuine, transient
-/// denial recovers on its own.
-const fn is_absence(status: u16) -> bool {
-    matches!(status, 403 | 404)
+/// `404` is the obvious one. `403` counts only on the CDN, which is object
+/// storage without list permission and answers a request for an object that was
+/// never stored with `403` rather than `404` — the case for any release
+/// published before rendered READMEs existed. A `403` from the API means
+/// something else entirely, most likely that this client has been refused, and
+/// treating that as absence would bury it.
+const fn is_absence(status: u16, origin: Origin) -> bool {
+    matches!(status, 404) || (status == 403 && matches!(origin, Origin::Cdn))
 }
 
 /// Classify a URL's host, rejecting anything outside the allowed set.
@@ -688,6 +715,22 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_cdn_object_is_absence_but_a_refusal_from_the_api_is_not() {
+        // The CDN is object storage without list permission, so 403 is how it
+        // reports an object that was never stored. A 403 from the API means
+        // this client has been refused, which must not be filed as "not there".
+        assert!(is_absence(403, Origin::Cdn));
+        assert!(!is_absence(403, Origin::Api));
+        assert!(!is_absence(403, Origin::Docs));
+
+        for origin in [Origin::Api, Origin::Cdn, Origin::Docs] {
+            assert!(is_absence(404, origin), "404 is absence everywhere");
+            assert!(!is_absence(500, origin));
+            assert!(!is_absence(200, origin));
+        }
+    }
+
+    #[test]
     fn backoff_grows_with_each_attempt_and_stays_bounded() {
         // Building a fetcher makes no requests, so this needs no network.
         let fetcher = Fetcher::new(&Config::new("test/1.0 (+https://example.invalid)"))
@@ -771,6 +814,15 @@ mod tests {
         assert_eq!(effective_ttl(configured, &forbidden), Duration::ZERO);
 
         assert_eq!(effective_ttl(configured, &HeaderMap::new()), configured);
+    }
+
+    #[test]
+    fn a_weak_entity_tag_is_sent_without_its_weakness_marker() {
+        // The CDN weakens a tag when it compresses the response, then declines
+        // to match the weak form it just issued. Dropping the marker is what
+        // makes revalidation of a compressed response actually return 304.
+        assert_eq!(if_none_match(r#"W/"abc""#), r#""abc""#);
+        assert_eq!(if_none_match(r#""abc""#), r#""abc""#);
     }
 
     #[test]
