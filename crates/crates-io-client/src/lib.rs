@@ -208,15 +208,16 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::VersionNotFound`] if the version has no README, which
-    /// crates.io reports the same way as an unknown version.
+    /// Returns [`Error::ReadmeUnavailable`] if the release has no rendered
+    /// README, which is the case for anything published before crates.io began
+    /// rendering them.
     pub async fn readme(&self, name: &str, version: &str, max_chars: usize) -> Result<Arc<String>> {
         let url = api::readme_url(name, version)?;
         let body = self
             .fetcher
             .get(&url, Policy::cached(self.ttl.readme, self.ttl.negative))
             .await
-            .map_err(|err| missing_version(err, name, version))?;
+            .map_err(|err| missing_readme(err, name, version))?;
         body.derive(|bytes| {
             let html = String::from_utf8_lossy(bytes);
             Ok::<_, Error>(readme::to_markdown(&html, max_chars))
@@ -235,7 +236,9 @@ impl Client {
             .fetcher
             .get(&url, Policy::cached(self.ttl.docs_status, self.ttl.negative))
             .await
-            .map_err(|err| missing_docs(err, name, version))?;
+            .map_err(|err| {
+                missing_docs(err, name, version, "docs.rs has no record of this release")
+            })?;
         body.derive(|bytes| {
             serde_json::from_slice::<BuildStatus>(bytes)
                 .map_err(|err| Error::Decode { url: url.clone(), message: err.to_string() })
@@ -264,7 +267,15 @@ impl Client {
             .fetcher
             .get(&url, Policy::cached(RUSTDOC_BODY_TTL, self.ttl.negative))
             .await
-            .map_err(|err| missing_docs(err, name, version))?;
+            .map_err(|err| {
+                missing_docs(
+                    err,
+                    name,
+                    version,
+                    "docs.rs published no rustdoc JSON for this release, which it only generates \
+                     for recent enough builds",
+                )
+            })?;
 
         let limit = self.max_rustdoc_bytes;
         let parsed = body.derive(|bytes| {
@@ -294,23 +305,33 @@ fn missing_crate(err: Error, name: &str) -> Error {
     }
 }
 
-/// Translate a `404` on a version-level resource into a version-level error.
-fn missing_version(err: Error, name: &str, version: &str) -> Error {
+/// Translate the absence of a rendered README into a README-specific error.
+///
+/// The version itself may well exist: releases published before crates.io
+/// rendered READMEs have none, and the static CDN reports that with a `403`
+/// rather than a `404`. Reporting it as a missing *version* would be actively
+/// misleading.
+fn missing_readme(err: Error, name: &str, version: &str) -> Error {
     match err {
-        Error::Upstream { status: 404, .. } => {
-            Error::VersionNotFound { name: name.to_owned(), selector: version.to_owned() }
+        Error::Upstream { status: 403 | 404, .. } => {
+            Error::ReadmeUnavailable { name: name.to_owned(), version: version.to_owned() }
         },
         other => other,
     }
 }
 
 /// Translate a `404` from docs.rs into a documentation-specific error.
-fn missing_docs(err: Error, name: &str, version: &str) -> Error {
+///
+/// The reason is supplied by the caller because the two docs.rs endpoints mean
+/// different things by `404`: the status endpoint has no record of the release
+/// at all, while the rustdoc JSON endpoint may simply have no JSON for a build
+/// old enough to predate it.
+fn missing_docs(err: Error, name: &str, version: &str, reason: &str) -> Error {
     match err {
         Error::Upstream { status: 404, .. } => Error::DocsUnavailable {
             name: name.to_owned(),
             version: version.to_owned(),
-            reason: "docs.rs has no successfully built documentation for this release".to_owned(),
+            reason: reason.to_owned(),
         },
         other => other,
     }
@@ -333,12 +354,27 @@ mod tests {
 
         assert!(matches!(missing_crate(upstream(), "serde"), Error::CrateNotFound { .. }));
         assert!(matches!(
-            missing_version(upstream(), "serde", "9.9.9"),
-            Error::VersionNotFound { .. }
+            missing_readme(upstream(), "serde", "0.0.0"),
+            Error::ReadmeUnavailable { .. }
         ));
         assert!(matches!(
-            missing_docs(upstream(), "serde", "9.9.9"),
+            missing_docs(upstream(), "serde", "9.9.9", "because"),
             Error::DocsUnavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn a_release_with_no_rendered_readme_is_not_reported_as_a_missing_version() {
+        // The static CDN is object storage without list permission, so it
+        // answers for an object that was never stored with 403, not 404.
+        let forbidden = Error::Upstream {
+            url: "https://static.crates.io/x".to_owned(),
+            status: 403,
+            detail: None,
+        };
+        assert!(matches!(
+            missing_readme(forbidden, "serde", "0.0.0"),
+            Error::ReadmeUnavailable { .. }
         ));
     }
 

@@ -57,6 +57,15 @@ pub enum Error {
         selector: String,
     },
 
+    /// The release exists, but no rendered README was ever stored for it.
+    #[error("crate {name:?} {version} has no rendered README")]
+    ReadmeUnavailable {
+        /// The crate that was looked up.
+        name: String,
+        /// The resolved version.
+        version: String,
+    },
+
     /// Documentation is not available for the requested crate version.
     #[error("no documentation is available for {name:?} {version}: {reason}")]
     DocsUnavailable {
@@ -151,6 +160,7 @@ impl Error {
             | Self::InvalidArgument(_) => Category::InvalidInput,
             Self::CrateNotFound { .. }
             | Self::VersionNotFound { .. }
+            | Self::ReadmeUnavailable { .. }
             | Self::DocsUnavailable { .. } => Category::NotFound,
             _ => Category::Upstream,
         }
@@ -166,6 +176,7 @@ impl Error {
             Self::InvalidArgument(_) => "invalid_argument",
             Self::CrateNotFound { .. } => "crate_not_found",
             Self::VersionNotFound { .. } => "version_not_found",
+            Self::ReadmeUnavailable { .. } => "readme_unavailable",
             Self::DocsUnavailable { .. } => "docs_unavailable",
             Self::Upstream { .. } => "upstream_error",
             Self::Network { .. } => "network_error",

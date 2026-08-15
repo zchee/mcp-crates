@@ -301,7 +301,7 @@ impl Fetcher {
             },
         };
 
-        let cacheable = (policy.store && entry.status < 300) || entry.status == 404;
+        let cacheable = (policy.store && entry.status < 300) || is_absence(entry.status);
         if cacheable {
             self.bodies.insert(Arc::clone(&key), Arc::clone(&entry)).await;
         }
@@ -454,7 +454,7 @@ impl Fetcher {
             let body = self.read_body(response, &current).await?;
             self.counters.bytes_received.fetch_add(body.len() as u64, Ordering::Relaxed);
 
-            let ttl = if status.as_u16() == 404 {
+            let ttl = if is_absence(status.as_u16()) {
                 policy.negative_ttl
             } else {
                 effective_ttl(policy.ttl, &headers)
@@ -497,6 +497,20 @@ impl Fetcher {
         }
         Ok(buffer)
     }
+}
+
+/// Whether a status means "this resource is not there", and so is worth
+/// remembering briefly.
+///
+/// `404` is the obvious one. `403` is here because the crates.io static CDN is
+/// object storage without list permission, which answers a request for an
+/// object that was never stored with `403` rather than `404` — the case for any
+/// release published before rendered READMEs existed. Remembering it for the
+/// negative lifetime keeps a caller from re-spending an API request on the same
+/// absent document; the lifetime is short enough that a genuine, transient
+/// denial recovers on its own.
+const fn is_absence(status: u16) -> bool {
+    matches!(status, 403 | 404)
 }
 
 /// Classify a URL's host, rejecting anything outside the allowed set.
