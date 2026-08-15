@@ -249,6 +249,31 @@ async fn out_of_range_pagination_is_rejected() {
 }
 
 #[tokio::test]
+async fn the_dependency_schema_distinguishes_an_unrequested_kind_from_an_empty_one() {
+    let mut server = Server::start().await;
+
+    let result = server.call("tools/list", json!({})).await.expect("tools/list succeeds");
+    let tool = result["tools"]
+        .as_array()
+        .expect("tools is an array")
+        .iter()
+        .find(|tool| tool["name"] == "get_crate_dependencies")
+        .expect("the tool is listed");
+
+    // A model reads this schema to interpret the result, so the three kinds
+    // have to be nullable for absence to mean anything different from empty.
+    let output = &tool["outputSchema"];
+    if output.is_object() {
+        for kind in ["normal", "dev", "build"] {
+            let field = &output["properties"][kind];
+            assert!(!field.is_null(), "{kind} should appear in the output schema: {output}");
+        }
+    }
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_zero_readme_budget_is_rejected_rather_than_returning_a_marker() {
     let mut server = Server::start().await;
 

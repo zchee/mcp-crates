@@ -93,8 +93,12 @@ const MAX_VERSION_LEN: usize = 64;
 /// non-conforming version.
 pub fn validate_version(version: &str) -> Result<(), Error> {
     // The semver character set, which is all any published version can use.
+    // Dots are part of it, which leaves `.` and `..` conforming and meaning
+    // something else entirely once they reach a URL path, so a version that is
+    // nothing but dots is refused outright.
     let conforming = !version.is_empty()
         && version.len() <= MAX_VERSION_LEN
+        && !version.bytes().all(|byte| byte == b'.')
         && version
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'));
@@ -210,6 +214,10 @@ mod tests {
     fn versions_that_could_escape_the_url_path_are_rejected() {
         for bad in [
             "",
+            // The only two conforming strings a URL path reads as a traversal.
+            ".",
+            "..",
+            "...",
             "1.0.0/../../../owners",
             "1.0.0?include=full",
             "1.0.0#frag",

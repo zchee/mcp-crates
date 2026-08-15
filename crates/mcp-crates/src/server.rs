@@ -261,15 +261,16 @@ impl CratesServer {
         let index = self.client.index(&args.name).await.map_err(|err| to_error_data(&err))?;
         let entry = Self::resolve(&index, &selector)?;
 
-        let collect = |kind: DepKind| -> Vec<DependencyEntry> {
-            if !kinds.contains(&kind) {
-                return Vec::new();
-            }
-            entry
-                .deps_of_kind(DependencyKind::from(kind))
-                .filter(|dep| include_optional || !dep.optional)
-                .map(DependencyEntry::from)
-                .collect()
+        // `None` for a kind that was not asked for, so that an empty list can
+        // mean what it says: this release has none of that kind.
+        let collect = |kind: DepKind| -> Option<Vec<DependencyEntry>> {
+            kinds.contains(&kind).then(|| {
+                entry
+                    .deps_of_kind(DependencyKind::from(kind))
+                    .filter(|dep| include_optional || !dep.optional)
+                    .map(DependencyEntry::from)
+                    .collect()
+            })
         };
 
         Ok(Json(CrateDependenciesResult {

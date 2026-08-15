@@ -372,7 +372,7 @@ impl DocIndex {
     /// memory use.
     #[must_use]
     pub fn weight(&self) -> u32 {
-        let bytes = self
+        let items = self
             .items
             .iter()
             .map(|item| {
@@ -382,7 +382,20 @@ impl DocIndex {
                     + size_of::<DocItem>()
             })
             .sum::<usize>();
-        u32::try_from(bytes).unwrap_or(u32::MAX)
+        // Counted too: a facade crate is almost all re-exports, so leaving them
+        // out would understate exactly the crates where they dominate.
+        let reexports = self
+            .reexports
+            .iter()
+            .map(|reexport| {
+                reexport.name.len()
+                    + reexport.defining_crate.len()
+                    + reexport.path.len()
+                    + reexport.kind.len()
+                    + size_of::<Reexport>()
+            })
+            .sum::<usize>();
+        u32::try_from(items + reexports).unwrap_or(u32::MAX)
     }
 
     /// Look an item up by path.
@@ -481,18 +494,21 @@ fn collect_reexports(root: &RustdocRoot) -> Vec<Reexport> {
             if target.crate_id == 0 || target.path.is_empty() {
                 return None;
             }
-            let defining_crate = root
-                .external_crates
-                .get(&target.crate_id.to_string())
-                .map(|external| external.name.as_str())
-                .unwrap_or("an unnamed crate");
+            // A crate this document does not name cannot be looked up, and the
+            // whole value of a re-export entry is telling a caller where to go
+            // next, so an unnamed one is dropped rather than described.
+            let defining_crate = root.external_crates.get(&target.crate_id.to_string())?;
+            if defining_crate.name.is_empty() {
+                return None;
+            }
             Some(Reexport {
                 name: body.alias.clone().or_else(|| item.name.clone())?.into_boxed_str(),
-                defining_crate: Box::from(defining_crate),
+                defining_crate: defining_crate.name.as_str().into(),
                 path: target.path.join("::").into_boxed_str(),
                 kind: target.kind.clone().into_boxed_str(),
             })
         })
+        .take(MAX_ITEMS)
         .collect()
 }
 
@@ -868,6 +884,43 @@ mod tests {
     }
 
     #[test]
+    fn a_reexport_from_a_crate_the_document_does_not_name_is_dropped() {
+        // The entry exists to say where to look next. "re-exported from an
+        // unnamed crate" is not something a caller can act on.
+        let anonymous = r#"{
+            "paths": {
+                "0:0": {"crate_id": 0, "path": ["demo"], "kind": "module"},
+                "80": {"crate_id": 7, "path": ["ghost", "Thing"], "kind": "struct"}
+            },
+            "external_crates": {},
+            "index": {
+                "0:0": {"docs": "The demo crate."},
+                "81": {"inner": {"use": {"source": "ghost::Thing", "name": "Thing", "id": 80}}}
+            }
+        }"#;
+        let index = DocIndex::parse("demo", anonymous.as_bytes()).expect("parses");
+
+        assert!(index.reexports().is_empty());
+        assert!(index.lookup("Thing").reexported.is_empty());
+    }
+
+    #[test]
+    fn the_weight_counts_reexports_as_well_as_items() {
+        let index = index();
+        assert!(!index.reexports().is_empty(), "the fixture has one");
+
+        let counted: usize = index
+            .reexports()
+            .iter()
+            .map(|reexport| reexport.name.len() + reexport.path.len())
+            .sum();
+        assert!(
+            index.weight() as usize > counted,
+            "a facade crate is almost all re-exports; leaving them out understates it"
+        );
+    }
+
+    #[test]
     fn only_genuine_reexports_are_recorded_not_every_foreign_item_mentioned() {
         // The path table names foreign items merely because something refers to
         // them; without following the `use` items, a lookup would suggest
@@ -957,6 +1010,10 @@ mod tests {
         ));
         for builder in [status_url, rustdoc_url, html_url] {
             assert!(matches!(builder("serde", "1.0.0?x=1"), Err(Error::InvalidVersion { .. })));
+            // `..` conforms to the semver character set but is a path segment,
+            // and one that walks the URL up a level.
+            assert!(matches!(builder("serde", ".."), Err(Error::InvalidVersion { .. })));
         }
+        assert!(matches!(crate::api::readme_url("serde", ".."), Err(Error::InvalidVersion { .. })));
     }
 }

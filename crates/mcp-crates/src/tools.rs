@@ -476,17 +476,21 @@ pub struct CrateDependenciesResult {
     /// enables it, and this says which. Entries of the form `dep:name` name an
     /// optional dependency directly.
     pub features: std::collections::BTreeMap<String, Vec<String>>,
-    /// Dependencies linked into the crate itself. Omitted when `normal` was not
-    /// among the requested kinds, so an empty list always means no such
-    /// dependencies rather than a kind that was not asked for.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub normal: Vec<DependencyEntry>,
-    /// Dependencies of tests, examples and benchmarks.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub dev: Vec<DependencyEntry>,
-    /// Dependencies of the build script.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub build: Vec<DependencyEntry>,
+    /// Dependencies linked into the crate itself.
+    ///
+    /// Present whenever `normal` was among the requested kinds, so an empty
+    /// list means the release has none. A kind that was not requested is absent
+    /// rather than empty, which is a different answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normal: Option<Vec<DependencyEntry>>,
+    /// Dependencies of tests, examples and benchmarks. Absent unless `dev` was
+    /// among the requested kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dev: Option<Vec<DependencyEntry>>,
+    /// Dependencies of the build script. Absent unless `build` was among the
+    /// requested kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<Vec<DependencyEntry>>,
 }
 
 // --------------------------------------------------------- documentation ---
