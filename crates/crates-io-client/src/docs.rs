@@ -347,14 +347,72 @@ struct IndexItem {
     deprecation: Option<IgnoredAny>,
     /// A single-entry map of item kind to body, such as `{"trait": {...}}`.
     #[serde(default)]
-    inner: Option<HashMap<String, ItemBody>>,
+    inner: Option<Inner>,
 }
 
 impl IndexItem {
     /// The item's kind and body.
     fn classify(&self) -> Option<(&str, &ItemBody)> {
         let inner = self.inner.as_ref()?;
-        inner.iter().next().map(|(kind, body)| (kind.as_str(), body))
+        // A rustdoc kind is never empty, so the empty name is free to mean "the
+        // map carried no entry", which is what an absent `inner` used to mean.
+        (!inner.kind.is_empty()).then(|| (inner.kind.as_ref(), &inner.body))
+    }
+}
+
+/// The kinds whose body this index reads.
+///
+/// A trait lists its members, a struct, enum or union lists its impl blocks, an
+/// impl block says whether it implements a trait and lists its members, and a
+/// `use` names what it points at. Every other kind — function, module, macro,
+/// constant, associated type — contributes its name and nothing else, and on a
+/// real document those are most of the index.
+const KINDS_WITH_A_BODY_WORTH_READING: [&str; 6] =
+    ["trait", "struct", "enum", "union", "impl", "use"];
+
+/// The one `{kind: body}` entry a rustdoc item's `inner` carries.
+///
+/// Modelled as a pair rather than a map because it has never been anything but
+/// a single entry, and a map costs an allocation and a hash per item to
+/// rediscover that.
+#[derive(Default)]
+struct Inner {
+    kind: Box<str>,
+    body: ItemBody,
+}
+
+impl<'de> Deserialize<'de> for Inner {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        deserializer.deserialize_map(InnerVisitor)
+    }
+}
+
+struct InnerVisitor;
+
+impl<'de> Visitor<'de> for InnerVisitor {
+    type Value = Inner;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a rustdoc item body keyed by kind")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Inner, A::Error> {
+        let Some(kind) = map.next_key::<Cow<'_, str>>()? else {
+            return Ok(Inner::default());
+        };
+
+        // A body this index will never read is stepped over in one move rather
+        // than entered and skipped a field at a time.
+        let body = if KINDS_WITH_A_BODY_WORTH_READING.contains(&kind.as_ref()) {
+            map.next_value::<ItemBody>()?
+        } else {
+            map.next_value::<IgnoredAny>()?;
+            ItemBody::default()
+        };
+
+        let inner = Inner { kind: kind.as_ref().into(), body };
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(inner)
     }
 }
 
