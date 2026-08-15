@@ -54,3 +54,10 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+
+# Proc-macro crates are dlopen'd by rustc during this same build, and a stripped
+# dylib is unloadable on macOS ("mis-aligned LINKEDIT string pool"), so the
+# release settings must not reach them.
+[profile.release.build-override]
+strip = false
+codegen-units = 16
