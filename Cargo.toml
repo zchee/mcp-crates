@@ -7,7 +7,6 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/zchee/mcp-crates"
-authors = ["Koichi Shiraishi <zchee.io@gmail.com>"]
 
 [workspace.dependencies]
 crates-io-client = { version = "0.1.0", path = "crates/crates-io-client" }
