@@ -60,6 +60,11 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+# Nothing in this server catches a panic, so the unwinding machinery is landing
+# pads and tables for a path that only ever ends in the process dying anyway.
+# Cargo ignores this for the test and bench profiles, so the suites and the
+# benchmarks keep unwinding and keep reporting a failure as a failure.
+panic = "abort"
 
 # Proc-macro crates are dlopen'd by rustc during this same build, and a stripped
 # dylib is unloadable on macOS ("mis-aligned LINKEDIT string pool"), so the
