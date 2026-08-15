@@ -323,6 +323,9 @@ pub fn validate_name(name: &str) -> Result<()> {
 /// Returns [`Error::InvalidCrateName`] if the name is not one the registry
 /// could have accepted.
 pub fn index_path(name: &str) -> Result<String> {
+    // Also what makes the byte slicing below sound: the name is ASCII-only
+    // after this, so `len` counts characters and every index is a character
+    // boundary. A name allowed to carry multi-byte characters would panic here.
     validate_name(name)?;
     let lower = name.to_ascii_lowercase();
     let path = match lower.len() {

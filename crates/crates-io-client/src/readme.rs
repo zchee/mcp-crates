@@ -149,6 +149,9 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
         kept_bytes = text.char_indices().nth(max_chars).map_or(text.len(), |(offset, _)| offset);
     }
 
+    // Sound because `kept_bytes` is only ever a sum of whole line lengths or a
+    // `char_indices` offset, both of which land on character boundaries. An
+    // offset computed from a character count would not.
     let head = text[..kept_bytes].trim_end();
     let mut output = String::with_capacity(head.len() + TRUNCATION_MARKER.len());
     output.push_str(head);

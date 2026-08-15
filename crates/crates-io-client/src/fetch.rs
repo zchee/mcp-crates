@@ -653,6 +653,14 @@ fn extract_detail(body: &[u8]) -> Option<String> {
     }
     let text = String::from_utf8_lossy(body);
     let trimmed = text.trim();
+    // Dropping markup is what keeps this detail free of anything a crate author
+    // wrote, and consumers rely on that: the detail is reported to a caller
+    // unframed, on the grounds that only the registry itself composes these
+    // strings. The two responses that could carry publisher-adjacent bytes are
+    // both markup — the CDN answers a missing README object with an XML error
+    // document, docs.rs with an HTML page — so this guard is the reason the
+    // grounds hold. Salvaging text out of markup here would make the channel
+    // publisher-reachable and that decision would have to be revisited.
     if trimmed.is_empty() || trimmed.starts_with('<') {
         return None;
     }
@@ -930,8 +938,25 @@ mod tests {
         assert_eq!(extract_detail(body), Some("Not Found; and more".to_owned()));
 
         assert_eq!(extract_detail(b""), None);
-        assert_eq!(extract_detail(b"<!DOCTYPE html><html></html>"), None, "html is not a message");
         assert_eq!(extract_detail(b"plain failure"), Some("plain failure".to_owned()));
+    }
+
+    #[test]
+    fn a_markup_error_page_yields_no_detail_at_all() {
+        // Load-bearing rather than tidiness. The detail reaches a caller
+        // unframed because only the registry composes these strings, and the
+        // responses that could carry anything a crate author wrote are exactly
+        // these two: the CDN answers a missing README object with XML, docs.rs
+        // with HTML. Making either of these return text would put
+        // publisher-influenced bytes into an unframed channel.
+        let cdn_error =
+            br#"<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code></Error>"#;
+        assert_eq!(extract_detail(cdn_error), None);
+
+        let docs_error = b"<!DOCTYPE html>\n<html><body>not found</body></html>";
+        assert_eq!(extract_detail(docs_error), None);
+
+        assert_eq!(extract_detail(b"   \n  <html>"), None, "leading whitespace does not evade it");
     }
 
     #[test]
