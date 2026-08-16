@@ -32,6 +32,12 @@ options back.
 - **Disk-cache artifacts carry a schema-version header.** If you change any
   stored shape (`DocIndex`, persisted index bodies), bump
   `cache_schema_version` — old files must be rejected, never reinterpreted.
+- **A result field that is skipped must also be defaulted.** Each tool's
+  `outputSchema` is generated from the types in `crates/mcp-crates/src/tools.rs`
+  under schemars' *deserialize* contract, which reads `#[serde(default)]` and
+  ignores `skip_serializing_if`. A non-`Option` field carrying only the skip is
+  published as required and then never sent, and a client that validates
+  structured content rejects the whole result.
 
 ## Benchmarks and fixtures
 
