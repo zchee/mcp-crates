@@ -5,6 +5,13 @@
 //! every field that survives here has to earn its place: fields that repeat
 //! something already present, or that no caller can act on, are dropped rather
 //! than passed through.
+//!
+//! A result field that is left out when it is false or empty must say
+//! `#[serde(default)]` beside its `skip_serializing_if`, unless its type is
+//! `Option`. The schema published as a tool's `outputSchema` is generated from
+//! these types under schemars' deserialize contract, which reads the default
+//! but not the skip, so without it the schema demands a key the server never
+//! sends and a client that validates structured content rejects the result.
 
 use crates_io_client::{
     CrateCategory, CrateSummary, DependencyKind, DocItem, IndexDep, IndexEntry, Reexport, Sort,
@@ -124,10 +131,10 @@ pub struct CrateHit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
     /// Whether every version of this crate has been yanked.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub yanked: bool,
     /// Whether the query matched this crate's name exactly.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exact_match: bool,
 }
 
@@ -313,10 +320,10 @@ pub struct VersionEntry {
     /// The version number.
     pub version: String,
     /// Whether this version has been yanked.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub yanked: bool,
     /// Whether this version is a pre-release.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prerelease: bool,
     /// The minimum supported Rust version this release declares.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -423,12 +430,12 @@ pub struct DependencyEntry {
     /// The Cargo version requirement.
     pub requirement: String,
     /// Whether the dependency is optional, i.e. enabled by a feature.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub optional: bool,
     /// Whether the dependency's default features are enabled.
     pub default_features: bool,
     /// Features explicitly enabled on the dependency.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
     /// The platform or `cfg` expression this dependency is conditional on.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -538,7 +545,7 @@ pub struct ItemDoc {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub documentation: Option<String>,
     /// Whether the item is deprecated.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deprecated: bool,
 }
 
@@ -610,12 +617,12 @@ pub struct CrateDocumentationResult {
     pub item: Option<ItemDoc>,
     /// Items the `item` argument could have meant, when it did not resolve to
     /// exactly one.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suggestions: Vec<ItemDoc>,
     /// Where to find the item when this crate only re-exports it. Facade
     /// crates, whose public API is mostly `pub use` of their own sub-crates,
     /// document almost nothing themselves.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reexported: Vec<ReexportedItem>,
     /// How many documented items the release has, when its rustdoc JSON was
     /// read.

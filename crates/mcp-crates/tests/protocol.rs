@@ -5,8 +5,17 @@
 //! made. That last part is the point — a tool that rejects a malformed crate
 //! name must do so without spending the request budget on it.
 
-use std::{process::Stdio, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    process::Stdio,
+    time::Duration,
+};
 
+use mcp_crates::tools::{
+    CrateDependenciesResult, CrateDocumentationResult, CrateInfoResult, CrateVersionsResult,
+    SearchCratesResult,
+};
+use schemars::{JsonSchema, generate::SchemaSettings};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -267,6 +276,76 @@ async fn the_dependency_schema_distinguishes_an_unrequested_kind_from_an_empty_o
         for kind in ["normal", "dev", "build"] {
             let field = &output["properties"][kind];
             assert!(!field.is_null(), "{kind} should appear in the output schema: {output}");
+        }
+    }
+
+    server.shutdown().await;
+}
+
+/// What serialization can actually put on the wire, as a schema.
+///
+/// The same derive read under schemars' serialize contract, where a property is
+/// optional exactly when `skip_serializing_if` may drop it. That is the one
+/// question the published schema has to agree with.
+fn what_serialization_emits<T: JsonSchema>() -> Value {
+    SchemaSettings::draft2020_12()
+        .for_serialize()
+        .into_generator()
+        .into_root_schema_for::<T>()
+        .to_value()
+}
+
+/// The required property names of every object in a schema, keyed by where the
+/// object is defined: the root itself, then each entry in `$defs`.
+fn required_properties(schema: &Value) -> BTreeMap<String, BTreeSet<String>> {
+    fn required(object: &Value) -> BTreeSet<String> {
+        object["required"]
+            .as_array()
+            .map(|names| names.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    let mut objects = BTreeMap::from([("the result itself".to_owned(), required(schema))]);
+    if let Some(defs) = schema.get("$defs").and_then(Value::as_object) {
+        objects.extend(defs.iter().map(|(name, object)| (name.clone(), required(object))));
+    }
+    objects
+}
+
+#[tokio::test]
+async fn no_output_schema_demands_a_field_that_serialization_drops() {
+    // rmcp derives `outputSchema` under schemars' deserialize contract, which
+    // knows nothing about `skip_serializing_if`: a field dropped when it is
+    // false or empty is still listed as required unless it also carries
+    // `#[serde(default)]`. A client that validates structured content against
+    // that schema then rejects a perfectly good result, so the two views of
+    // each result type have to agree.
+    let emitted = [
+        ("search_crates", what_serialization_emits::<SearchCratesResult>()),
+        ("get_crate_info", what_serialization_emits::<CrateInfoResult>()),
+        ("get_crate_versions", what_serialization_emits::<CrateVersionsResult>()),
+        ("get_crate_dependencies", what_serialization_emits::<CrateDependenciesResult>()),
+        ("get_crate_documentation", what_serialization_emits::<CrateDocumentationResult>()),
+    ];
+
+    let mut server = Server::start().await;
+    let result = server.call("tools/list", json!({})).await.expect("tools/list succeeds");
+    let tools = result["tools"].as_array().expect("tools is an array");
+
+    for (name, wire) in &emitted {
+        let tool = tools.iter().find(|tool| tool["name"] == *name).expect("the tool is listed");
+        let always_present = required_properties(wire);
+
+        for (object, demanded) in required_properties(&tool["outputSchema"]) {
+            let present = always_present
+                .get(&object)
+                .unwrap_or_else(|| panic!("{name}: {object} is published but never serialized"));
+            let droppable: Vec<&str> = demanded.difference(present).map(String::as_str).collect();
+            assert!(
+                droppable.is_empty(),
+                "{name}: the schema requires {droppable:?} of {object}, which serialization \
+                 omits when it is empty"
+            );
         }
     }
 
