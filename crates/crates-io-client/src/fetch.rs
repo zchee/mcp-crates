@@ -250,15 +250,7 @@ impl Fetcher {
             jitter: AtomicU64::new(0x9E37_79B9_7F4A_7C15),
             max_body_bytes: config.max_body_bytes,
             max_retries: config.max_retries,
-            disk: config
-                .disk_cache
-                .then(|| {
-                    config
-                        .cache_dir
-                        .clone()
-                        .map_or_else(DiskStore::discover, |root| Some(DiskStore::at(root)))
-                })
-                .flatten(),
+            disk: config.disk_store(),
         })
     }
 

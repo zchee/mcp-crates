@@ -147,17 +147,7 @@ impl Client {
     ///
     /// As [`Client::new`].
     pub fn with_ttl(config: Config, ttl: Ttl) -> Result<Self> {
-        // A disk cache the platform will not name a directory for is a disk
-        // cache that does not run, rather than one guessing at a path.
-        let disk = config
-            .disk_cache
-            .then(|| {
-                config
-                    .cache_dir
-                    .clone()
-                    .map_or_else(DiskStore::discover, |root| Some(DiskStore::at(root)))
-            })
-            .flatten();
+        let disk = config.disk_store();
 
         // Bounded once per process, off the request path entirely: a prune
         // walks the whole directory, and no caller should ever wait for it.

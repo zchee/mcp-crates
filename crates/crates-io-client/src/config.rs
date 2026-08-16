@@ -89,6 +89,21 @@ pub struct Config {
 }
 
 impl Config {
+    /// The disk store this configuration describes, or `None` when the disk
+    /// cache is disabled or the platform names no cache directory.
+    ///
+    /// A disk cache the platform will not name a directory for is a disk cache
+    /// that does not run, rather than one guessing at a path.
+    pub(crate) fn disk_store(&self) -> Option<crate::disk::Store> {
+        self.disk_cache
+            .then(|| {
+                self.cache_dir.clone().map_or_else(crate::disk::Store::discover, |root| {
+                    Some(crate::disk::Store::at(root))
+                })
+            })
+            .flatten()
+    }
+
     /// Build a configuration with the crates.io-compliant defaults and the
     /// given user agent.
     #[must_use]
