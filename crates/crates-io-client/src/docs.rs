@@ -816,7 +816,6 @@ impl DocIndex {
     /// Documentation prose dominates and varies by orders of magnitude between
     /// crates, so a cache bounded by entry count would be a poor proxy for
     /// memory use.
-    /// All of it, which is now a sum of buffer lengths rather than a walk.
     ///
     /// Counted too: the lowercase copy of the paths, which is real memory the
     /// arena layout added, and the re-export text, because a facade crate is
