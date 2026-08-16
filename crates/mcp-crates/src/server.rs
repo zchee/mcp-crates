@@ -302,7 +302,8 @@ impl CratesServer {
             // A zero budget yields nothing but the truncation marker, which is
             // never what a caller meant; `include_readme: false` says it.
             return Err(invalid_argument(
-                "max_readme_chars must be at least 1; use include_readme: false to omit the                  README entirely",
+                "max_readme_chars must be at least 1; use include_readme: false to omit the \
+                 README entirely",
             ));
         }
         let max_chars = args
