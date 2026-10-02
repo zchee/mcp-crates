@@ -12,7 +12,7 @@ use rmcp::{
         router::tool::ToolRouter,
         wrapper::{Json, Parameters},
     },
-    model::{Implementation, ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router,
 };
 
@@ -460,14 +460,14 @@ enum Docs {
 // `tools/list` and `tools/call`.
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for CratesServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let mut implementation =
             Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
         implementation.title = Some("crates.io".to_owned());
         implementation.description = Some(env!("CARGO_PKG_DESCRIPTION").to_owned());
         implementation.website_url = Some(env!("CARGO_PKG_REPOSITORY").to_owned());
 
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = implementation;
         info.instructions = Some(INSTRUCTIONS.to_owned());
