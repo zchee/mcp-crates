@@ -334,7 +334,7 @@ impl Fetcher {
                     detail: Some("the origin sent 304 without a cached copy to refresh".to_owned()),
                 })?;
                 Arc::new(previous.revalidated(ttl))
-            },
+            }
         };
 
         // The origin matters for what counts as absence, and after redirects it
@@ -404,7 +404,7 @@ impl Fetcher {
         match tokio::task::spawn_blocking(move || store.store(&key, &record)).await {
             Ok(Ok(())) => {
                 self.counters.disk_writes.fetch_add(1, Ordering::Relaxed);
-            },
+            }
             Ok(Err(err)) => tracing::debug!(%err, url, "could not cache the response body"),
             Err(err) => tracing::debug!(%err, url, "the response cache writer did not finish"),
         }
@@ -445,13 +445,13 @@ impl Fetcher {
                         "retrying transient upstream failure"
                     );
                     tokio::time::sleep(delay).await;
-                },
+                }
                 Err(err) => {
                     if matches!(err, Error::RateLimitQueueFull { .. }) {
                         self.counters.shed.fetch_add(1, Ordering::Relaxed);
                     }
                     return Err(err);
-                },
+                }
             }
         }
     }

@@ -403,7 +403,7 @@ impl Client {
             match outcome {
                 Ok(Ok(())) => {
                     self.disk_writes.fetch_add(1, Ordering::Relaxed);
-                },
+                }
                 Ok(Err(err)) => tracing::debug!(%err, "could not cache the documentation index"),
                 Err(err) => tracing::debug!(%err, "the documentation cache writer did not finish"),
             }
@@ -440,7 +440,7 @@ fn missing_readme(err: Error, name: &str, version: &str) -> Error {
     match err {
         Error::Upstream { status: 403 | 404, .. } => {
             Error::ReadmeUnavailable { name: name.to_owned(), version: version.to_owned() }
-        },
+        }
         other => other,
     }
 }

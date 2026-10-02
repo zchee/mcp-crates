@@ -103,7 +103,7 @@ impl Pacer {
             Reservation::At(deadline) => {
                 tokio::time::sleep_until(deadline).await;
                 Ok(())
-            },
+            }
         }
     }
 

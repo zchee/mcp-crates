@@ -42,7 +42,7 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("parse_probe: {error}");
             ExitCode::FAILURE
-        },
+        }
     }
 }
 

@@ -351,7 +351,7 @@ impl CratesServer {
             Some(Err(err)) => {
                 notes.push(format!("the README could not be read: {err}"));
                 None
-            },
+            }
             None => None,
         };
 
@@ -374,7 +374,7 @@ impl CratesServer {
                     notes.push(format!("the docs.rs build status could not be read: {err}"));
                     None
                 }
-            },
+            }
             Docs::Index(Ok(doc_index)) => {
                 documented_items = Some(doc_index.len());
                 if doc_index.is_truncated() {
@@ -409,7 +409,7 @@ impl CratesServer {
                     });
                 }
                 Some(true)
-            },
+            }
             Docs::Index(Err(err)) => {
                 // Absent rustdoc JSON does not mean docs.rs failed to build the
                 // release: it only publishes the JSON for builds recent enough
@@ -422,7 +422,7 @@ impl CratesServer {
                      documentation may still exist at {docs_rs_url}"
                 ));
                 None
-            },
+            }
         };
 
         Ok(Json(CrateDocumentationResult {

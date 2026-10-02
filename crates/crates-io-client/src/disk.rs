@@ -249,7 +249,7 @@ impl Store {
                 let _ = fs::remove_file(&path);
                 tracing::debug!(?reason, path = %path.display(), "discarded a cache entry");
                 Ok(None)
-            },
+            }
         }
     }
 
@@ -500,7 +500,7 @@ mod tests {
                             "byte {position} bit {bit} decoded differently"
                         );
                         harmless += 1;
-                    },
+                    }
                 }
             }
         }

@@ -478,12 +478,12 @@ impl<'de> Visitor<'de> for ItemBodyVisitor {
                 "impls" => body.impls = map.next_value()?,
                 "trait" => {
                     body.is_trait_impl = map.next_value::<Option<IgnoredAny>>()?.is_some();
-                },
+                }
                 "id" => body.target = map.next_value()?,
                 "name" => body.alias = map.next_value()?,
                 _ => {
                     map.next_value::<IgnoredAny>()?;
-                },
+                }
             }
         }
         Ok(body)
@@ -1159,7 +1159,7 @@ impl Arenas {
                     let span = Self::push(&mut text.kinds, &mut self.overflowed, name);
                     kinds.insert(name.into(), span);
                     span
-                },
+                }
             };
             row.path = path;
             row.docs = docs;
@@ -1259,7 +1259,7 @@ fn resolve<'a>(candidates: &[DocItem<'a>]) -> Option<Lookup<'a>> {
         [] => None,
         [only] => {
             Some(Lookup { found: Some(*only), suggestions: Vec::new(), reexported: Vec::new() })
-        },
+        }
         many => Some(Lookup {
             found: None,
             suggestions: shortlist(many.to_vec()),

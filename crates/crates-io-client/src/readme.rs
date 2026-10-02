@@ -63,8 +63,8 @@ fn destination_end(text: &str, from: usize) -> Option<usize> {
                 if depth == 0 {
                     return Some(from + offset);
                 }
-            },
-            _ => {},
+            }
+            _ => {}
         }
     }
     None
@@ -210,7 +210,7 @@ fn strip_tags(html: &str) -> String {
             '<' => inside_tag = true,
             '>' => inside_tag = false,
             _ if !inside_tag => output.push(character),
-            _ => {},
+            _ => {}
         }
     }
     output
